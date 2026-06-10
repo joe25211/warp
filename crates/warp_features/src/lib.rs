@@ -886,6 +886,9 @@ pub enum FeatureFlag {
     /// Gates the SuperGrok feature, which lets users
     /// connect a Grok subscription instead of pasting an API key.
     SuperGrok,
+    /// Enables global search in remote sessions by running ripgrep on the
+    /// remote host via the remote server daemon.
+    RemoteGlobalSearch,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
@@ -951,6 +954,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     #[cfg(not(windows))]
     FeatureFlag::SshRemoteServer,
     FeatureFlag::RemoteCodebaseIndexing,
+    FeatureFlag::RemoteGlobalSearch,
     FeatureFlag::AsyncFind,
     FeatureFlag::GPTConfigurableContextWindow,
     FeatureFlag::RestorePromptOnInlineModelSelectorSearch,

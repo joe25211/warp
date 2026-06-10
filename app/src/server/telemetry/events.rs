@@ -1581,6 +1581,19 @@ pub enum TelemetryEvent {
     },
     GlobalSearchOpened,
     GlobalSearchQueryStarted,
+    GlobalSearchQueryCompleted {
+        duration_ms: u64,
+        /// Number of distinct remote hosts searched via the remote server
+        /// daemon (0 for purely local searches).
+        remote_host_count: usize,
+        total_match_count: usize,
+        /// Whether the result set was capped (locally or by a remote
+        /// server-side cap).
+        capped: bool,
+        /// Number of search sources (local, or one per remote host) that
+        /// failed while the others completed.
+        source_failures: usize,
+    },
     AICommandSearchOpened {
         entrypoint: AICommandSearchEntrypoint,
     },
@@ -4249,6 +4262,19 @@ impl TelemetryEvent {
             | TelemetryEvent::GlobalSearchOpened
             | TelemetryEvent::GlobalSearchQueryStarted
             | TelemetryEvent::GetStartedSkipToTerminal => None,
+            TelemetryEvent::GlobalSearchQueryCompleted {
+                duration_ms,
+                remote_host_count,
+                total_match_count,
+                capped,
+                source_failures,
+            } => Some(json!({
+                "duration_ms": duration_ms,
+                "remote_host_count": remote_host_count,
+                "total_match_count": total_match_count,
+                "capped": capped,
+                "source_failures": source_failures,
+            })),
             TelemetryEvent::SSHControlMasterError { has_remote_server } => Some(json!({
                 "has_remote_server": has_remote_server,
             })),
@@ -4968,6 +4994,7 @@ impl TelemetryEvent {
             | TelemetryEvent::KeybindingsPageOpened
             | TelemetryEvent::GlobalSearchOpened
             | TelemetryEvent::GlobalSearchQueryStarted
+            | TelemetryEvent::GlobalSearchQueryCompleted { .. }
             | TelemetryEvent::CommandSearchOpened { .. }
             | TelemetryEvent::CommandSearchExited { .. }
             | TelemetryEvent::CommandSearchResultAccepted { .. }
@@ -5535,6 +5562,7 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::KeybindingsPageOpened => EnablementState::Always,
             Self::GlobalSearchOpened => EnablementState::Always,
             Self::GlobalSearchQueryStarted => EnablementState::Always,
+            Self::GlobalSearchQueryCompleted => EnablementState::Always,
             Self::CommandSearchOpened => EnablementState::Always,
             Self::CommandSearchExited => EnablementState::Always,
             Self::CommandSearchResultAccepted => EnablementState::Always,
@@ -6042,6 +6070,7 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::KeybindingsPageOpened => "Resource Center Keybindings Page Opened",
             Self::GlobalSearchOpened => "Global Search Opened",
             Self::GlobalSearchQueryStarted => "Global Search Query Started",
+            Self::GlobalSearchQueryCompleted => "Global Search Query Completed",
             Self::CommandSearchOpened => "Command Search Opened",
             Self::CommandSearchExited => "Command Search Exited",
             Self::CommandSearchResultAccepted => "Command Search Result Accepted",
@@ -7006,6 +7035,9 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::FileTreeToggled => "Opened the file tree/project explorer",
             Self::GlobalSearchOpened => "Opened the global search view",
             Self::GlobalSearchQueryStarted => "Started a global search (warp_ripgrep) search",
+            Self::GlobalSearchQueryCompleted => {
+                "Completed a global search across local and remote sources"
+            }
             Self::FileTreeItemAttachedAsContext => {
                 "Attached a file or directory as context from the file tree"
             }
