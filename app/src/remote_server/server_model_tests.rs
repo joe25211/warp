@@ -1,17 +1,23 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use string_offset::ByteOffset;
+use warp_ripgrep::search::{Match as RipgrepMatch, Submatch};
 use warp_util::standardized_path::StandardizedPath;
 use warpui::App;
 
 use super::super::diff_state_tracker::RemoteDiffStateManager;
 use super::super::proto::{
-    server_message, write_file_response, Authenticate, Initialize, ServerMessage,
-    WriteFileResponse, WriteFileSuccess,
+    server_message, write_file_response, Authenticate, Initialize, RipgrepSearchMatch,
+    RipgrepSearchSubmatch, ServerMessage, WriteFileResponse, WriteFileSuccess,
 };
 use super::super::protocol::RequestId;
 use super::super::server_buffer_tracker::ServerBufferTracker;
-use super::{ConnectionId, PendingFileOps, ServerModel};
+use super::{
+    ripgrep_match_response_bytes, ripgrep_match_to_proto, try_push_ripgrep_match, ConnectionId,
+    PendingFileOps, ServerModel,
+};
 use crate::auth::auth_state::AuthState;
 use crate::code_review::diff_state::DiffMode;
 use crate::remote_server::diff_state_tracker::DiffModelKey;
@@ -266,6 +272,103 @@ fn host_scoped_response_fails_over_when_target_missing() {
         assert_eq!(received.request_id, request_id.to_string());
         assert!(!model.host_scoped_requests.contains_key(&request_id));
     });
+}
+
+// ── Ripgrep search match conversion ──────────────────────────────────
+
+fn submatch(start: usize, end: usize) -> Submatch {
+    Submatch {
+        byte_start: ByteOffset::from(start),
+        byte_end: ByteOffset::from(end),
+    }
+}
+
+#[test]
+fn ripgrep_match_to_proto_maps_fields() {
+    let m = RipgrepMatch {
+        file_path: PathBuf::from("/repo/src/main.rs"),
+        line_number: 42,
+        line_text: "fn main() {}".to_string(),
+        submatches: vec![submatch(3, 7)],
+    };
+
+    let proto = ripgrep_match_to_proto(m);
+
+    assert_eq!(proto.file_path, "/repo/src/main.rs");
+    assert_eq!(proto.line_number, 42);
+    assert_eq!(proto.line_text, "fn main() {}");
+    assert_eq!(proto.submatches.len(), 1);
+    assert_eq!(proto.submatches[0].byte_start, 3);
+    assert_eq!(proto.submatches[0].byte_end, 7);
+}
+
+#[test]
+fn ripgrep_match_to_proto_preserves_late_submatch_and_full_line() {
+    let line = format!("{}needle", "x".repeat(8_000));
+    let m = RipgrepMatch {
+        file_path: PathBuf::from("/repo/long.rs"),
+        line_number: 1,
+        line_text: line.clone(),
+        submatches: vec![submatch(8_000, 8_006)],
+    };
+
+    let proto = ripgrep_match_to_proto(m);
+
+    assert_eq!(proto.line_text, line);
+    assert_eq!(proto.submatches[0].byte_start, 8_000);
+    assert_eq!(proto.submatches[0].byte_end, 8_006);
+}
+
+fn proto_match(line_text: &str, submatch_count: usize) -> RipgrepSearchMatch {
+    RipgrepSearchMatch {
+        file_path: "/repo/a.rs".to_string(),
+        line_number: 1,
+        line_text: line_text.to_string(),
+        submatches: (0..submatch_count)
+            .map(|index| RipgrepSearchSubmatch {
+                byte_start: index as u64,
+                byte_end: index as u64 + 1,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn try_push_ripgrep_match_caps_expanded_result_rows() {
+    let mut matches = Vec::new();
+    let mut result_count = 0;
+    let mut response_bytes = 0;
+
+    assert!(!try_push_ripgrep_match(
+        &mut matches,
+        &mut result_count,
+        &mut response_bytes,
+        proto_match("abc", 3),
+        2,
+        usize::MAX,
+    ));
+    assert!(matches.is_empty());
+    assert_eq!(result_count, 0);
+    assert_eq!(response_bytes, 0);
+}
+
+#[test]
+fn try_push_ripgrep_match_caps_encoded_response_bytes() {
+    let m = proto_match(&"x".repeat(1_000), 1);
+    let encoded_bytes = ripgrep_match_response_bytes(&m);
+    let mut matches = Vec::new();
+    let mut result_count = 0;
+    let mut response_bytes = 0;
+
+    assert!(!try_push_ripgrep_match(
+        &mut matches,
+        &mut result_count,
+        &mut response_bytes,
+        m,
+        usize::MAX,
+        encoded_bytes - 1,
+    ));
+    assert!(matches.is_empty());
 }
 
 #[test]

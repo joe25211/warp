@@ -10,6 +10,8 @@ use ::ai::index::full_source_code_embedding::manager::{
 use ::ai::index::full_source_code_embedding::{
     ContentHash, FragmentMetadata as LocalFragmentMetadata, NodeHash,
 };
+use futures::StreamExt as _;
+use prost::Message as _;
 use remote_server::proto::OpenBufferSuccess;
 use repo_metadata::repositories::{DetectedRepositories, RepoDetectionSource};
 use repo_metadata::{RepoMetadataEvent, RepoMetadataModel, RepositoryIdentifier};
@@ -37,13 +39,14 @@ use super::proto::{
     get_fragment_metadata_from_hash_response, git_commit_chain_response, git_create_pr_response,
     git_generate_commit_message_response, git_get_committed_branch_files_response,
     git_get_pr_info_response, git_push_response, host_scoped_request, notification,
-    resolve_conflict_response, run_command_response, save_buffer_response, server_message,
-    session_scoped_request, write_file_response, Abort, Authenticate, BranchInfo, BufferEdit,
-    BufferUpdatedPush, ClientMessage, CloseBuffer, CodebaseIndexLimits, CodebaseIndexStatus,
-    CodebaseIndexStatusUpdated, CodebaseIndexStatusesSnapshot, CodebaseResyncMode, DeleteFile,
-    DeleteFileResponse, DeleteFileSuccess, DiscardFilesError, DiscardFilesResponse,
-    DiscardFilesSuccess, DropCodebaseIndex, ErrorCode, ErrorResponse, FailedFileRead,
-    FileContextProto, FileOperationError, FragmentMetadata as ProtoFragmentMetadata,
+    resolve_conflict_response, ripgrep_search_response, run_command_response, save_buffer_response,
+    server_message, session_scoped_request, write_file_response, Abort, Authenticate, BranchInfo,
+    BufferEdit, BufferUpdatedPush, ClientMessage, CloseBuffer, CodebaseIndexLimits,
+    CodebaseIndexStatus, CodebaseIndexStatusUpdated, CodebaseIndexStatusesSnapshot,
+    CodebaseResyncMode, DeleteFile, DeleteFileResponse, DeleteFileSuccess, DiscardFilesError,
+    DiscardFilesResponse, DiscardFilesSuccess, DropCodebaseIndex, ErrorCode, ErrorResponse,
+    FailedFileRead, FileContextProto, FileOperationError,
+    FragmentMetadata as ProtoFragmentMetadata,
     FragmentMetadataLookupError as ProtoFragmentMetadataLookupError,
     FragmentMetadataLookupErrorCode, GetBranchesError, GetBranchesResponse, GetBranchesSuccess,
     GetDiffStateResponse, GetFragmentMetadataFromHash, GetFragmentMetadataFromHashResponse,
@@ -56,9 +59,11 @@ use super::proto::{
     Initialize, InitializeResponse, MissingFragmentMetadata, NavigatedToDirectory,
     NavigatedToDirectoryResponse, OpenBuffer, OpenBufferResponse, ReadFileContextResponse,
     ResolveConflict, ResolveConflictResponse, ResolveConflictSuccess, ResyncCodebase,
-    RunCommandError, RunCommandErrorCode, RunCommandRequest, RunCommandResponse, RunCommandSuccess,
-    SaveBuffer, SaveBufferResponse, SaveBufferSuccess, ServerMessage, SessionBootstrapped,
-    TextEdit, UploadHandoffSnapshot, WriteFile, WriteFileResponse, WriteFileSuccess,
+    RipgrepSearchError, RipgrepSearchMatch, RipgrepSearchRequest, RipgrepSearchResponse,
+    RipgrepSearchSubmatch, RipgrepSearchSuccess, RunCommandError, RunCommandErrorCode,
+    RunCommandRequest, RunCommandResponse, RunCommandSuccess, SaveBuffer, SaveBufferResponse,
+    SaveBufferSuccess, ServerMessage, SessionBootstrapped, TextEdit, UploadHandoffSnapshot,
+    WriteFile, WriteFileResponse, WriteFileSuccess,
 };
 use super::server_buffer_tracker::{PendingBufferRequestKind, ServerBufferTracker};
 use crate::code::global_buffer_model::{GlobalBufferModel, GlobalBufferModelEvent};
@@ -74,6 +79,20 @@ pub const GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10 
 /// Prevents a client from forcing the daemon to enumerate an arbitrarily
 /// large ref list.
 const MAX_BRANCH_COUNT_CAP: usize = 500;
+
+/// Server-side cap on the number of result rows returned by `RipgrepSearch`.
+///
+/// This counts the rows the client will display after expanding a matched
+/// line's submatches, rather than only counting matched lines.
+const MAX_RIPGREP_SEARCH_MATCH_CAP: usize = 5_000;
+/// Byte budget for the encoded `RipgrepSearchMatch` messages in one response.
+///
+/// Eight MB keeps transfer latency and memory bounded well below the
+/// protocol's 64 MB frame limit, while leaving room for repeated-field
+/// framing, response envelopes, and future fields. Individual matches are
+/// never truncated: truncating before a late submatch would corrupt both its
+/// preview and click location.
+const MAX_RIPGREP_SEARCH_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Unique identifier for a connected proxy session in daemon mode.
 pub type ConnectionId = uuid::Uuid;
@@ -771,6 +790,9 @@ impl ServerModel {
                     }
                     Some(host_scoped_request::Message::GitGetCommittedBranchFiles(m)) => {
                         self.handle_get_committed_branch_files(m, &request_id, conn_id, ctx)
+                    }
+                    Some(host_scoped_request::Message::RipgrepSearch(m)) => {
+                        self.handle_ripgrep_search(m, &request_id, conn_id, ctx)
                     }
                     None => {
                         log::warn!(
@@ -2754,6 +2776,100 @@ impl ServerModel {
         HandlerOutcome::Async(Some(handle))
     }
 
+    /// Handles `RipgrepSearch` — request/response backing global search in
+    /// remote sessions.
+    ///
+    /// Runs the same ripgrep subprocess used by local global search (the
+    /// daemon binary includes the `ripgrep-search` worker subcommand) over
+    /// the requested roots and responds with all matches once the search
+    /// completes, capped to bound response size. Cancellable via `Abort`
+    /// like other async handlers.
+    fn handle_ripgrep_search(
+        &mut self,
+        msg: RipgrepSearchRequest,
+        request_id: &RequestId,
+        conn_id: ConnectionId,
+        ctx: &mut ModelContext<Self>,
+    ) -> HandlerOutcome {
+        log::info!(
+            "Handling RipgrepSearch ({} roots, request_id={request_id})",
+            msg.roots.len()
+        );
+
+        if msg.pattern.is_empty() || msg.roots.is_empty() {
+            return ripgrep_search_error_response(
+                "RipgrepSearch requires a pattern and at least one root".to_string(),
+            );
+        }
+        if let Some(root) = msg.roots.iter().find(|root| !Path::new(root).is_absolute()) {
+            return ripgrep_search_error_response(format!(
+                "RipgrepSearch root must be absolute: {root}"
+            ));
+        }
+
+        let roots: Vec<PathBuf> = msg.roots.iter().map(PathBuf::from).collect();
+        let match_cap = match msg.max_matches as usize {
+            0 => MAX_RIPGREP_SEARCH_MATCH_CAP,
+            requested => requested.min(MAX_RIPGREP_SEARCH_MATCH_CAP),
+        };
+        let pattern = msg.pattern;
+        let ignore_case = msg.ignore_case;
+        let multiline = msg.multiline;
+
+        let request_id_for_response = request_id.clone();
+        let handle = self.spawn_request_handler(
+            request_id.clone(),
+            async move {
+                let stream = warp_ripgrep::search::search_streaming(
+                    std::slice::from_ref(&pattern),
+                    &roots,
+                    ignore_case,
+                    multiline,
+                )?;
+                futures::pin_mut!(stream);
+
+                let mut matches = Vec::new();
+                let mut result_count = 0;
+                let mut response_bytes = 0;
+                let mut capped = false;
+                while let Some(m) = stream.next().await {
+                    let m = ripgrep_match_to_proto(m);
+                    if !try_push_ripgrep_match(
+                        &mut matches,
+                        &mut result_count,
+                        &mut response_bytes,
+                        m,
+                        match_cap,
+                        MAX_RIPGREP_SEARCH_RESPONSE_BYTES,
+                    ) {
+                        capped = true;
+                        break;
+                    }
+                }
+                anyhow::Ok(RipgrepSearchSuccess { matches, capped })
+            },
+            move |me, result: anyhow::Result<RipgrepSearchSuccess>, _ctx| {
+                let response = match result {
+                    Ok(success) => RipgrepSearchResponse {
+                        result: Some(ripgrep_search_response::Result::Success(success)),
+                    },
+                    Err(err) => RipgrepSearchResponse {
+                        result: Some(ripgrep_search_response::Result::Error(RipgrepSearchError {
+                            message: format!("{err:#}"),
+                        })),
+                    },
+                };
+                me.send_server_message(
+                    Some(conn_id),
+                    Some(&request_id_for_response),
+                    server_message::Message::RipgrepSearchResponse(response),
+                );
+            },
+            ctx,
+        );
+        HandlerOutcome::Async(Some(handle))
+    }
+
     /// Handles `DiscardFilesRequest` — request/response.
     ///
     /// Runs git restore/stash on the remote filesystem for the specified files.
@@ -3256,6 +3372,70 @@ fn invalid_request_response(message: String) -> HandlerOutcome {
         code: ErrorCode::InvalidRequest.into(),
         message,
     }))
+}
+
+fn ripgrep_search_error_response(message: String) -> HandlerOutcome {
+    HandlerOutcome::Sync(server_message::Message::RipgrepSearchResponse(
+        RipgrepSearchResponse {
+            result: Some(ripgrep_search_response::Result::Error(RipgrepSearchError {
+                message,
+            })),
+        },
+    ))
+}
+
+/// Converts a ripgrep match to its proto form without altering line text or
+/// submatch offsets. Response-wide caps bound payload size without corrupting
+/// individual matches.
+fn ripgrep_match_to_proto(m: warp_ripgrep::search::Match) -> RipgrepSearchMatch {
+    RipgrepSearchMatch {
+        file_path: m.file_path.to_string_lossy().to_string(),
+        line_number: m.line_number,
+        line_text: m.line_text,
+        submatches: m
+            .submatches
+            .into_iter()
+            .map(|submatch| RipgrepSearchSubmatch {
+                byte_start: submatch.byte_start.as_usize() as u64,
+                byte_end: submatch.byte_end.as_usize() as u64,
+            })
+            .collect(),
+    }
+}
+
+/// Number of result rows the client will produce from a matched line.
+fn ripgrep_match_result_count(m: &RipgrepSearchMatch) -> usize {
+    m.submatches.len().max(1)
+}
+
+/// Conservative encoded-byte contribution of one match inside the response's
+/// repeated `matches` field. `encoded_len` excludes that repeated field's tag
+/// and length prefix, for which ten bytes is a safe upper bound.
+fn ripgrep_match_response_bytes(m: &RipgrepSearchMatch) -> usize {
+    m.encoded_len().saturating_add(10)
+}
+/// Adds a match to the response only when it fits both the expanded result-row
+/// cap and encoded-byte budget. Returns whether the match was added.
+fn try_push_ripgrep_match(
+    matches: &mut Vec<RipgrepSearchMatch>,
+    result_count: &mut usize,
+    response_bytes: &mut usize,
+    m: RipgrepSearchMatch,
+    result_cap: usize,
+    response_byte_cap: usize,
+) -> bool {
+    let match_result_count = ripgrep_match_result_count(&m);
+    let match_response_bytes = ripgrep_match_response_bytes(&m);
+    if result_count.saturating_add(match_result_count) > result_cap
+        || response_bytes.saturating_add(match_response_bytes) > response_byte_cap
+    {
+        return false;
+    }
+
+    *result_count += match_result_count;
+    *response_bytes += match_response_bytes;
+    matches.push(m);
+    true
 }
 
 fn codebase_index_status_response(status: CodebaseIndexStatus) -> HandlerOutcome {
