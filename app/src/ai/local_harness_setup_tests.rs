@@ -20,6 +20,24 @@ fn claude_is_disabled_for_missing_cli() {
 }
 
 #[test]
+fn hermes_is_ready_when_cli_is_installed() {
+    assert_eq!(
+        local_harness_setup_state_with_cli_resolver(Harness::Hermes, |_| true),
+        LocalHarnessSetupState::Ready
+    );
+}
+
+#[test]
+fn hermes_requires_cli() {
+    assert_eq!(
+        local_harness_setup_state_with_cli_resolver(Harness::Hermes, |_| false),
+        LocalHarnessSetupState::MissingHarness {
+            tooltip: LOCAL_HARNESS_INSTALLATION_REQUIRED_TOOLTIP,
+        }
+    );
+}
+
+#[test]
 fn codex_is_enabled_when_flag_is_on() {
     let _local_codex = FeatureFlag::LocalClaudeCodexChildHarnesses.override_enabled(true);
 

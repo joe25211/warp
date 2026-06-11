@@ -427,7 +427,9 @@ fn harness_to_graphql_harness(harness: Harness) -> Option<warp_graphql::ai::Agen
         Harness::Claude => Some(warp_graphql::ai::AgentHarness::ClaudeCode),
         Harness::Gemini => Some(warp_graphql::ai::AgentHarness::Gemini),
         Harness::Codex => Some(warp_graphql::ai::AgentHarness::Codex),
-        Harness::OpenCode | Harness::Unknown => None,
+        // Hermes/Migi is local-first in the self-host fork. It does not use Warp-managed
+        // harness auth secrets, so do not ask the cloud GraphQL API for secret metadata.
+        Harness::Hermes | Harness::OpenCode | Harness::Unknown => None,
     }
 }
 

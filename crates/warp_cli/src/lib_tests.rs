@@ -1706,10 +1706,34 @@ fn harness_parse_orchestration_harness_accepts_codex() {
 }
 
 #[test]
+fn harness_parse_orchestration_harness_accepts_hermes_aliases() {
+    assert_eq!(
+        Harness::parse_orchestration_harness("hermes"),
+        Some(Harness::Hermes)
+    );
+    assert_eq!(
+        Harness::parse_orchestration_harness("migi"),
+        Some(Harness::Hermes)
+    );
+}
+
+#[test]
 fn harness_parse_local_child_harness_accepts_codex() {
     assert_eq!(
         Harness::parse_local_child_harness("codex"),
         Some(Harness::Codex)
+    );
+}
+
+#[test]
+fn harness_parse_local_child_harness_accepts_hermes_aliases() {
+    assert_eq!(
+        Harness::parse_local_child_harness("hermes"),
+        Some(Harness::Hermes)
+    );
+    assert_eq!(
+        Harness::parse_local_child_harness("migi"),
+        Some(Harness::Hermes)
     );
 }
 

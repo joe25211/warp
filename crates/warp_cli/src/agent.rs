@@ -145,6 +145,9 @@ pub enum Harness {
     /// Delegate to the `codex` CLI.
     #[value(name = "codex")]
     Codex,
+    /// Delegate to the `hermes` CLI for Hermes/Migi-native agent runs.
+    #[value(name = "hermes", alias = "migi")]
+    Hermes,
     /// A harness produced by a newer client/server that this client doesn't
     /// recognize. Surfaced via deserialization fallbacks (e.g. unknown GraphQL
     /// enum values, unknown `harness_type` strings); never selectable from the
@@ -162,7 +165,9 @@ impl Harness {
 
     pub fn parse_local_child_harness(value: &str) -> Option<Self> {
         match Self::parse_orchestration_harness(value) {
-            Some(harness @ (Self::Claude | Self::OpenCode | Self::Codex)) => Some(harness),
+            Some(harness @ (Self::Claude | Self::OpenCode | Self::Codex | Self::Hermes)) => {
+                Some(harness)
+            }
             Some(Self::Oz) | Some(Self::Gemini) | Some(Self::Unknown) | None => None,
         }
     }
@@ -174,6 +179,7 @@ impl Harness {
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini CLI",
             Self::Codex => "Codex",
+            Self::Hermes => "Hermes / Migi",
             Self::Unknown => "Unknown",
         }
     }
@@ -192,6 +198,7 @@ impl Harness {
             "opencode" => Some(Harness::OpenCode),
             "gemini" => Some(Harness::Gemini),
             "codex" => Some(Harness::Codex),
+            "hermes" | "migi" => Some(Harness::Hermes),
             "unknown" => Some(Harness::Unknown),
             _ => None,
         }
@@ -209,6 +216,7 @@ impl Harness {
             Harness::OpenCode => "opencode",
             Harness::Gemini => "gemini",
             Harness::Codex => "codex",
+            Harness::Hermes => "hermes",
             Harness::Unknown => "unknown",
         }
     }

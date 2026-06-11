@@ -8,8 +8,8 @@ use warp_core::features::FeatureFlag;
 
 use super::{
     build_local_claude_child_command, build_local_codex_child_command,
-    build_local_opencode_child_command, local_child_task_config, local_claude_child_prompt,
-    normalize_local_child_harness, prepare_local_harness_child_launch,
+    build_local_hermes_child_command, build_local_opencode_child_command, local_child_task_config,
+    local_claude_child_prompt, normalize_local_child_harness, prepare_local_harness_child_launch,
     validate_local_harness_shell,
 };
 use crate::ai::agent_sdk::driver::OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV;
@@ -109,6 +109,11 @@ fn normalize_local_child_harness_accepts_supported_aliases() {
         Some(Harness::OpenCode)
     );
     assert_eq!(normalize_local_child_harness("codex"), Some(Harness::Codex));
+    assert_eq!(
+        normalize_local_child_harness("hermes"),
+        Some(Harness::Hermes)
+    );
+    assert_eq!(normalize_local_child_harness("migi"), Some(Harness::Hermes));
 }
 
 #[test]
@@ -168,8 +173,21 @@ fn build_local_codex_child_command_quotes_the_prompt() {
 }
 
 #[test]
+fn build_local_hermes_child_command_quotes_the_prompt() {
+    assert_eq!(
+        build_local_hermes_child_command("hello world"),
+        "hermes chat --quiet --query 'hello world'"
+    );
+}
+
+#[test]
 fn local_child_task_config_records_supported_third_party_harnesses() {
-    for harness in [Harness::Claude, Harness::OpenCode, Harness::Codex] {
+    for harness in [
+        Harness::Claude,
+        Harness::OpenCode,
+        Harness::Codex,
+        Harness::Hermes,
+    ] {
         assert_eq!(
             local_child_task_config(harness, None),
             Some(crate::ai::ambient_agents::task::AgentConfigSnapshot {
@@ -182,7 +200,12 @@ fn local_child_task_config_records_supported_third_party_harnesses() {
 
 #[test]
 fn local_child_task_config_stamps_orchestrator_name() {
-    for harness in [Harness::Claude, Harness::OpenCode, Harness::Codex] {
+    for harness in [
+        Harness::Claude,
+        Harness::OpenCode,
+        Harness::Codex,
+        Harness::Hermes,
+    ] {
         assert_eq!(
             local_child_task_config(harness, Some("frontend-tests".to_string())),
             Some(crate::ai::ambient_agents::task::AgentConfigSnapshot {
