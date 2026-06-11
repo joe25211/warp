@@ -32,6 +32,8 @@ Then launch the client against it:
 script/run-hermes-native
 ```
 
+`script/run-hermes-native` checks `WARP_SERVER_ROOT_URL/healthz` before compiling/launching the client. If you are pointing at a future compatible gateway without `/healthz`, set `WARP_HERMES_NATIVE_SKIP_GATEWAY_CHECK=1` to bypass the guard.
+
 Equivalent direct invocation:
 
 ```bash

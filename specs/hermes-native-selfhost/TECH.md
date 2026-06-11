@@ -127,6 +127,8 @@ Then launch the fork against it:
 script/run-hermes-native
 ```
 
+The launch script checks `WARP_SERVER_ROOT_URL/healthz` before running the client so it fails fast instead of silently falling back to a dead/self-host seam. Set `WARP_HERMES_NATIVE_SKIP_GATEWAY_CHECK=1` only when intentionally testing another compatible gateway.
+
 Verify the slice end-to-end:
 
 ```bash
