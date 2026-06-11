@@ -87,10 +87,18 @@ The gateway must eventually provide:
   - `createWorkflow` / `updateWorkflow`
   - `createGenericStringObject` / `bulkCreateObjects` / `updateGenericStringObject`
   - `getCloudObject` / `getUpdatedCloudObjects`
-- `GET /hermes/drive/objects`
-- `GET /hermes/drive/objects/<id>`
-- `POST /hermes/drive/objects`
-- `PUT /hermes/drive/objects/<id>`
+- `POST /graphql/v2` session-sharing registry response:
+  - `updateAgentTask` stores `taskId`, `sessionId`, `conversationId`, state, and status locally
+- REST session registry inspection:
+  - `GET /hermes/agent-tasks`
+  - `GET /hermes/agent-tasks/<task_id>`
+  - `GET /hermes/sessions/<session_id>`
+  - `GET /session/<session_id>` for a minimal local/Tailscale handoff page
+- REST Drive seam:
+  - `GET /hermes/drive/objects`
+  - `GET /hermes/drive/objects/<id>`
+  - `POST /hermes/drive/objects`
+  - `PUT /hermes/drive/objects/<id>`
 
 Objects are persisted in SQLite at `~/.local/share/hermes-warp-gateway/drive.sqlite` by default, or at `HERMES_WARP_GATEWAY_DB` / `--db` for tests/deployments. Workflow GraphQL mutations store `object_type=workflow`; generic string GraphQL mutations store `object_type=generic_string_object` and preserve `format`, `clientId`, and serialized prompt-like JSON payloads. This is the first wired compatibility layer for workflow/prompt-style Drive objects; it is still intentionally local-first and explicit-erroring for unknown resolvers.
 
@@ -101,6 +109,7 @@ The gateway can be configured with environment variables or CLI flags:
 - `HERMES_BASE_URL` / `--hermes-base-url`
 - `OPENAI_BASE_URL` / `--openai-base-url`
 - `HERMES_WARP_DEFAULT_MODEL` / `--default-model`
+- `WARP_SESSION_SHARING_SERVER_URL` / `--session-sharing-url`
 - `--print-env` emits matching `WARP_*` launch exports.
 
 Gateway packaging/operator artifacts:

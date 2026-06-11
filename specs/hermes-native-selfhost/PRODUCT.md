@@ -35,6 +35,7 @@ Joe wants a Warp Terminal fork that keeps the useful terminal/workspace/Drive/se
 8. Hermes/Migi is available as a first-class local harness option, including the `migi` alias.
 9. The gateway has a repo-local launch script, env example, user systemd unit, and operator docs.
 10. The docs cache under `~/.hermes/knowledge/warp-hermes-native/` records the Warp cloud/session/Drive docs used as source material.
+11. The gateway now has a first self-host session-sharing registry seam: `updateAgentTask` can persist a task/session/conversation binding locally, the binding is inspectable through `/hermes/agent-tasks/<task_id>` and `/hermes/sessions/<session_id>`, and `/session/<session_id>` gives a local/Tailscale handoff page instead of a Warp-hosted share surface.
 
 ## Later milestones
 - Replace the prototype `hermes-warp-gateway` with a typed service and GraphQL-compatible resolvers for login-free local workspace state, Drive object sync, harness catalog, and model list.

@@ -43,12 +43,16 @@ with tempfile.TemporaryDirectory() as tmpdir:
             str(port),
             '--db',
             db_path,
+            '--session-sharing-url',
+            f'ws://127.0.0.1:{port}/session-relay',
             '--print-env',
         ],
         text=True,
     )
     assert f'WARP_SERVER_ROOT_URL=http://127.0.0.1:{port}' in printed_env
     assert f'WARP_WS_SERVER_URL=ws://127.0.0.1:{port}/graphql/v2' in printed_env
+    assert f'WARP_SESSION_SHARING_SERVER_URL=ws://127.0.0.1:{port}/session-relay' in printed_env
+    assert 'sessions.app.warp.dev' not in printed_env
 
     proc = subprocess.Popen(
         [
@@ -60,6 +64,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
             str(port),
             '--db',
             db_path,
+            '--session-sharing-url',
+            f'ws://127.0.0.1:{port}/session-relay',
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -159,8 +165,17 @@ with tempfile.TemporaryDirectory() as tmpdir:
             'getUpdatedCloudObjects',
             'query getUpdatedCloudObjects { updatedCloudObjects { __typename ... on UpdatedCloudObjectsOutput { workflows { data metadata { uid } } genericStringObjects { format serializedModel metadata { uid } } deletedObjectUids { workflowUids genericStringObjectUids } } } }',
         )
+        task_update = graphql(
+            'updateAgentTask',
+            'mutation updateAgentTask($input: UpdateAgentTaskInput!) { updateAgentTask(input: $input) { __typename ... on UpdateAgentTaskOutput { responseContext { serverVersion } } } }',
+            {'input': {'taskId': 'task-smoke', 'sessionId': 'session-smoke', 'conversationId': 'conversation-smoke', 'taskState': 'IN_PROGRESS', 'statusMessage': {'message': 'sharing locally'}}},
+        )
+        task_lookup = request_json('GET', '/hermes/agent-tasks/task-smoke')['task']
+        session_lookup = request_json('GET', '/hermes/sessions/session-smoke')
+        session_page = urllib.request.urlopen(f'http://127.0.0.1:{port}/session/session-smoke', timeout=3).read().decode()
 
         assert health['ok'] is True
+        assert health['sessionSharingUrl'] == f'ws://127.0.0.1:{port}/session-relay'
         assert 'warp.dev' not in json.dumps(harness).lower()
         assert 'Hermes / Migi' in json.dumps(harness)
         assert 'Hermes / Migi' in json.dumps(models)
@@ -176,6 +191,12 @@ with tempfile.TemporaryDirectory() as tmpdir:
         assert any(obj['metadata']['uid'] == gql_workflow_uid for obj in updated_payload['workflows'])
         assert any(obj['metadata']['uid'] == gql_prompt_uid for obj in updated_payload['genericStringObjects'])
         assert 'summarize this now' in json.dumps(updated_payload)
+        assert task_update['data']['updateAgentTask']['__typename'] == 'UpdateAgentTaskOutput'
+        assert task_lookup['sessionId'] == 'session-smoke'
+        assert task_lookup['conversationId'] == 'conversation-smoke'
+        assert any(task['taskId'] == 'task-smoke' for task in session_lookup['tasks'])
+        assert 'Session session-smoke' in session_page
+        assert 'sessions.app.warp.dev' not in session_page
         print('gateway smoke ok')
     finally:
         proc.terminate()

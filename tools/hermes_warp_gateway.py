@@ -12,6 +12,7 @@ storage primitive while the exact Warp Drive GraphQL compatibility layer is mapp
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import sqlite3
@@ -27,6 +28,7 @@ PORT = int(os.environ.get("HERMES_WARP_GATEWAY_PORT", "8976"))
 HERMES_BASE_URL = os.environ.get("HERMES_BASE_URL", "http://127.0.0.1:9120")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8787/v1")
 DEFAULT_MODEL = os.environ.get("HERMES_WARP_DEFAULT_MODEL", "hermes/migi-default")
+SESSION_SHARING_URL = os.environ.get("WARP_SESSION_SHARING_SERVER_URL", "ws://127.0.0.1:8977")
 DB_PATH = Path(
     os.environ.get(
         "HERMES_WARP_GATEWAY_DB",
@@ -78,6 +80,21 @@ def _connect() -> sqlite3.Connection:
     }.items():
         if column not in columns:
             conn.execute(ddl)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_tasks (
+            task_id TEXT PRIMARY KEY,
+            session_id TEXT,
+            conversation_id TEXT,
+            task_state TEXT,
+            status_message TEXT,
+            error_code TEXT,
+            raw_input TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     return conn
 
 
@@ -97,6 +114,27 @@ def _row_to_object(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _row_to_agent_task(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "taskId": row["task_id"],
+        "sessionId": row["session_id"],
+        "conversationId": row["conversation_id"],
+        "taskState": row["task_state"],
+        "statusMessage": row["status_message"],
+        "errorCode": row["error_code"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "rawInput": json.loads(row["raw_input"]),
+    }
+
+
+def _input_value(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in data:
+            return data[key]
+    return None
+
+
 def _list_drive_objects(object_type: str | None = None) -> list[dict[str, Any]]:
     with _connect() as conn:
         if object_type:
@@ -113,6 +151,102 @@ def _get_drive_object(object_id: str) -> dict[str, Any] | None:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM drive_objects WHERE id = ?", (object_id,)).fetchone()
     return _row_to_object(row) if row else None
+
+
+def _upsert_agent_task(input_data: dict[str, Any]) -> dict[str, Any]:
+    task_id = str(_input_value(input_data, "taskId", "task_id", "taskID") or "").strip()
+    if not task_id:
+        raise ValueError("updateAgentTask input missing taskId")
+
+    status = _input_value(input_data, "statusMessage", "status_message")
+    if isinstance(status, dict):
+        status_message = str(status.get("message") or "")
+        error_code = status.get("errorCode") or status.get("error_code")
+    else:
+        status_message = None
+        error_code = None
+
+    patch = {
+        "task_id": task_id,
+        "session_id": _input_value(input_data, "sessionId", "session_id"),
+        "conversation_id": _input_value(input_data, "conversationId", "conversation_id"),
+        "task_state": _input_value(input_data, "taskState", "task_state"),
+        "status_message": status_message,
+        "error_code": error_code,
+        "raw_input": json.dumps(input_data, sort_keys=True),
+    }
+    timestamp = _now()
+    with _connect() as conn:
+        existing = conn.execute("SELECT * FROM agent_tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO agent_tasks (
+                    task_id, session_id, conversation_id, task_state, status_message, error_code,
+                    raw_input, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    patch["task_id"],
+                    patch["session_id"],
+                    patch["conversation_id"],
+                    patch["task_state"],
+                    patch["status_message"],
+                    patch["error_code"],
+                    patch["raw_input"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE agent_tasks
+                SET session_id = COALESCE(?, session_id),
+                    conversation_id = COALESCE(?, conversation_id),
+                    task_state = COALESCE(?, task_state),
+                    status_message = COALESCE(?, status_message),
+                    error_code = COALESCE(?, error_code),
+                    raw_input = ?,
+                    updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    patch["session_id"],
+                    patch["conversation_id"],
+                    patch["task_state"],
+                    patch["status_message"],
+                    patch["error_code"],
+                    patch["raw_input"],
+                    timestamp,
+                    task_id,
+                ),
+            )
+    found = _get_agent_task(task_id)
+    assert found is not None
+    return found
+
+
+def _get_agent_task(task_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM agent_tasks WHERE task_id = ?", (task_id,)).fetchone()
+    return _row_to_agent_task(row) if row else None
+
+
+def _list_agent_tasks() -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM agent_tasks ORDER BY updated_at DESC").fetchall()
+    return [_row_to_agent_task(row) for row in rows]
+
+
+def _list_session_tasks(session_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_tasks WHERE session_id = ? ORDER BY updated_at DESC",
+            (session_id,),
+        ).fetchall()
+    return [_row_to_agent_task(row) for row in rows]
 
 
 def _create_drive_object(payload: dict[str, Any]) -> dict[str, Any]:
@@ -465,6 +599,24 @@ def _cloud_object_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _update_agent_task_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
+    try:
+        task = _upsert_agent_task(_input(body))
+    except ValueError as exc:
+        return _graphql_error(str(exc), body)
+    return {
+        "data": {
+            "updateAgentTask": {
+                "__typename": "UpdateAgentTaskOutput",
+                "responseContext": _response_context(),
+                "taskId": task["taskId"],
+                "sessionId": task["sessionId"],
+                "conversationId": task["conversationId"],
+            }
+        }
+    }
+
+
 def _graphql_error(message: str, body: dict[str, Any]) -> dict[str, Any]:
     return {
         "errors": [
@@ -542,6 +694,8 @@ def _graphql_response(body: dict[str, Any]) -> dict[str, Any]:
         return _update_generic_string_object_from_graphql(body)
     if "updatedcloudobjects" in needle or "get_updated_cloud_objects" in needle:
         return _updated_cloud_objects_from_graphql(body)
+    if "updateagenttask" in needle or "update_agent_task" in needle:
+        return _update_agent_task_from_graphql(body)
     if "cloudobject" in needle or "get_cloud_object" in needle:
         return _cloud_object_from_graphql(body)
 
@@ -556,6 +710,14 @@ class Handler(BaseHTTPRequestHandler):
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_html(self, status: int, markup: str) -> None:
+        encoded = markup.encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "text/html; charset=utf-8")
         self.send_header("content-length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
@@ -576,6 +738,7 @@ class Handler(BaseHTTPRequestHandler):
                     "hermesBaseUrl": HERMES_BASE_URL,
                     "openaiBaseUrl": OPENAI_BASE_URL,
                     "defaultModel": DEFAULT_MODEL,
+                    "sessionSharingUrl": SESSION_SHARING_URL,
                     "driveDbPath": str(DB_PATH),
                 },
             )
@@ -593,6 +756,40 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "drive object not found"})
             else:
                 self._send_json(200, {"object": found})
+            return
+
+        if parsed.path == "/hermes/agent-tasks":
+            self._send_json(200, {"tasks": _list_agent_tasks()})
+            return
+
+        if parsed.path.startswith("/hermes/agent-tasks/"):
+            task_id = parsed.path.rsplit("/", 1)[-1]
+            found = _get_agent_task(task_id)
+            if found is None:
+                self._send_json(404, {"error": "agent task not found"})
+            else:
+                self._send_json(200, {"task": found})
+            return
+
+        if parsed.path.startswith("/hermes/sessions/"):
+            session_id = parsed.path.rsplit("/", 1)[-1]
+            self._send_json(200, {"sessionId": session_id, "tasks": _list_session_tasks(session_id)})
+            return
+
+        if parsed.path.startswith("/session/"):
+            session_id = parsed.path.rsplit("/", 1)[-1]
+            tasks = _list_session_tasks(session_id)
+            task_items = "".join(
+                f"<li><code>{html.escape(task['taskId'])}</code> — "
+                f"{html.escape(str(task.get('taskState') or 'state unknown'))}</li>"
+                for task in tasks
+            ) or "<li>No agent tasks have reported this session id yet.</li>"
+            safe_session_id = html.escape(session_id)
+            self._send_html(
+                200,
+                f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes Warp Session {safe_session_id}</title><style>body{{margin:0;background:#030405;color:#e8ecec;font-family:system-ui,sans-serif;padding:32px}}main{{max-width:880px;margin:auto;border:1px solid #343b3d;border-radius:24px;background:#0b0f10;padding:28px;box-shadow:0 24px 80px #000}}.k{{color:#c89b45;text-transform:uppercase;letter-spacing:.16em;font-weight:900;font-size:12px}}h1{{font-size:clamp(32px,6vw,64px);line-height:.9;margin:.25em 0}}code{{color:#d8b16c}}li{{margin:.6em 0}}a{{color:#d8b16c}}</style></head><body><main><div class="k">Hermes-native Warp · self-host session registry</div><h1>Session {safe_session_id}</h1><p>This is the local/Tailscale handoff surface for a Warp shared session. Full terminal relay is a later seam; this registry proves the client can bind agent tasks to a self-hosted session id without Warp cloud.</p><h2>Linked tasks</h2><ul>{task_items}</ul><p>Machine-readable state: <a href="/hermes/sessions/{safe_session_id}">/hermes/sessions/{safe_session_id}</a></p></main></body></html>""",
+            )
             return
 
         self._send_json(404, {"error": "not found"})
@@ -639,7 +836,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global HOST, PORT, HERMES_BASE_URL, OPENAI_BASE_URL, DEFAULT_MODEL, DB_PATH
+    global HOST, PORT, HERMES_BASE_URL, OPENAI_BASE_URL, DEFAULT_MODEL, SESSION_SHARING_URL, DB_PATH
 
     parser = argparse.ArgumentParser(
         description="Hermes-native Warp compatibility gateway prototype",
@@ -676,6 +873,11 @@ def main() -> None:
         help="default Hermes/Migi model id advertised to Warp",
     )
     parser.add_argument(
+        "--session-sharing-url",
+        default=SESSION_SHARING_URL,
+        help="self-host/Tailscale session sharing URL exported for Warp launch",
+    )
+    parser.add_argument(
         "--print-env",
         action="store_true",
         help="print matching WARP_* launch environment and exit",
@@ -687,13 +889,14 @@ def main() -> None:
     HERMES_BASE_URL = args.hermes_base_url
     OPENAI_BASE_URL = args.openai_base_url
     DEFAULT_MODEL = args.default_model
+    SESSION_SHARING_URL = args.session_sharing_url
     DB_PATH = Path(args.db).expanduser()
 
     if args.print_env:
         print("export WARP_HERMES_NATIVE=1")
         print(f"export WARP_SERVER_ROOT_URL=http://{HOST}:{PORT}")
         print(f"export WARP_WS_SERVER_URL=ws://{HOST}:{PORT}/graphql/v2")
-        print("export WARP_SESSION_SHARING_SERVER_URL=ws://127.0.0.1:8977")
+        print(f"export WARP_SESSION_SHARING_SERVER_URL={SESSION_SHARING_URL}")
         return
 
     _connect().close()
