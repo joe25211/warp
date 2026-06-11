@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+export HERMES_WARP_GATEWAY_HOST="${HERMES_WARP_GATEWAY_HOST:-127.0.0.1}"
+export HERMES_WARP_GATEWAY_PORT="${HERMES_WARP_GATEWAY_PORT:-8976}"
+export HERMES_WARP_GATEWAY_DB="${HERMES_WARP_GATEWAY_DB:-$HOME/.local/share/hermes-warp-gateway/drive.sqlite}"
+export HERMES_BASE_URL="${HERMES_BASE_URL:-http://127.0.0.1:9120}"
+export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://127.0.0.1:8787/v1}"
+export HERMES_WARP_DEFAULT_MODEL="${HERMES_WARP_DEFAULT_MODEL:-hermes/migi-default}"
+
+printf 'Starting Hermes-native Warp gateway\n' >&2
+printf '  gateway=http://%s:%s\n' "$HERMES_WARP_GATEWAY_HOST" "$HERMES_WARP_GATEWAY_PORT" >&2
+printf '  db=%s\n' "$HERMES_WARP_GATEWAY_DB" >&2
+printf '  hermes=%s\n' "$HERMES_BASE_URL" >&2
+printf '  openai=%s\n' "$OPENAI_BASE_URL" >&2
+printf '  model=%s\n' "$HERMES_WARP_DEFAULT_MODEL" >&2
+
+exec python3 tools/hermes_warp_gateway.py \
+  --host "$HERMES_WARP_GATEWAY_HOST" \
+  --port "$HERMES_WARP_GATEWAY_PORT" \
+  --db "$HERMES_WARP_GATEWAY_DB" \
+  --hermes-base-url "$HERMES_BASE_URL" \
+  --openai-base-url "$OPENAI_BASE_URL" \
+  --default-model "$HERMES_WARP_DEFAULT_MODEL"

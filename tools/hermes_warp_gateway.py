@@ -11,6 +11,7 @@ storage primitive while the exact Warp Drive GraphQL compatibility layer is mapp
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sqlite3
@@ -32,6 +33,16 @@ DB_PATH = Path(
         str(Path.home() / ".local/share/hermes-warp-gateway/drive.sqlite"),
     )
 )
+
+
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid port: {value}") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
 
 
 def _now() -> str:
@@ -319,6 +330,63 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global HOST, PORT, HERMES_BASE_URL, OPENAI_BASE_URL, DEFAULT_MODEL, DB_PATH
+
+    parser = argparse.ArgumentParser(
+        description="Hermes-native Warp compatibility gateway prototype",
+    )
+    parser.add_argument(
+        "--host",
+        default=HOST,
+        help="bind host (default: env HERMES_WARP_GATEWAY_HOST or 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=_port,
+        default=PORT,
+        help="bind port (default: env HERMES_WARP_GATEWAY_PORT or 8976)",
+    )
+    parser.add_argument(
+        "--db",
+        default=str(DB_PATH),
+        help="SQLite Drive object database path (default: env HERMES_WARP_GATEWAY_DB)",
+    )
+    parser.add_argument(
+        "--hermes-base-url",
+        default=HERMES_BASE_URL,
+        help="Hermes dashboard/API base URL advertised in health output",
+    )
+    parser.add_argument(
+        "--openai-base-url",
+        default=OPENAI_BASE_URL,
+        help="OpenAI-compatible provider base URL advertised in model catalog",
+    )
+    parser.add_argument(
+        "--default-model",
+        default=DEFAULT_MODEL,
+        help="default Hermes/Migi model id advertised to Warp",
+    )
+    parser.add_argument(
+        "--print-env",
+        action="store_true",
+        help="print matching WARP_* launch environment and exit",
+    )
+    args = parser.parse_args()
+
+    HOST = args.host
+    PORT = args.port
+    HERMES_BASE_URL = args.hermes_base_url
+    OPENAI_BASE_URL = args.openai_base_url
+    DEFAULT_MODEL = args.default_model
+    DB_PATH = Path(args.db).expanduser()
+
+    if args.print_env:
+        print("export WARP_HERMES_NATIVE=1")
+        print(f"export WARP_SERVER_ROOT_URL=http://{HOST}:{PORT}")
+        print(f"export WARP_WS_SERVER_URL=ws://{HOST}:{PORT}/graphql/v2")
+        print("export WARP_SESSION_SHARING_SERVER_URL=ws://127.0.0.1:8977")
+        return
+
     _connect().close()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"hermes-warp-gateway listening on http://{HOST}:{PORT}")

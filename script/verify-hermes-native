@@ -19,6 +19,7 @@ printf '%s\n' '== gateway smoke =='
 python - <<'PY'
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -27,9 +28,39 @@ import urllib.request
 
 with tempfile.TemporaryDirectory() as tmpdir:
     env = os.environ.copy()
-    env['HERMES_WARP_GATEWAY_DB'] = os.path.join(tmpdir, 'drive.sqlite')
+    db_path = os.path.join(tmpdir, 'drive.sqlite')
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+
+    printed_env = subprocess.check_output(
+        [
+            sys.executable,
+            'tools/hermes_warp_gateway.py',
+            '--host',
+            '127.0.0.1',
+            '--port',
+            str(port),
+            '--db',
+            db_path,
+            '--print-env',
+        ],
+        text=True,
+    )
+    assert f'WARP_SERVER_ROOT_URL=http://127.0.0.1:{port}' in printed_env
+    assert f'WARP_WS_SERVER_URL=ws://127.0.0.1:{port}/graphql/v2' in printed_env
+
     proc = subprocess.Popen(
-        [sys.executable, 'tools/hermes_warp_gateway.py'],
+        [
+            sys.executable,
+            'tools/hermes_warp_gateway.py',
+            '--host',
+            '127.0.0.1',
+            '--port',
+            str(port),
+            '--db',
+            db_path,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -38,8 +69,11 @@ with tempfile.TemporaryDirectory() as tmpdir:
     try:
         last = ''
         for _ in range(50):
+            if proc.poll() is not None:
+                output = proc.stdout.read() if proc.stdout is not None else ''
+                raise SystemExit(f'gateway exited early with {proc.returncode}: {output}')
             try:
-                with urllib.request.urlopen('http://127.0.0.1:8976/healthz', timeout=1) as response:
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=1) as response:
                     health = json.load(response)
                 break
             except Exception as exc:
@@ -51,7 +85,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         def graphql(operation, query):
             data = json.dumps({'operationName': operation, 'query': query}).encode()
             request = urllib.request.Request(
-                'http://127.0.0.1:8976/graphql/v2',
+                f'http://127.0.0.1:{port}/graphql/v2',
                 data=data,
                 headers={'content-type': 'application/json'},
                 method='POST',
@@ -62,7 +96,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         def request_json(method, path, payload=None):
             data = None if payload is None else json.dumps(payload).encode()
             request = urllib.request.Request(
-                'http://127.0.0.1:8976' + path,
+                f'http://127.0.0.1:{port}' + path,
                 data=data,
                 headers={'content-type': 'application/json'},
                 method=method,

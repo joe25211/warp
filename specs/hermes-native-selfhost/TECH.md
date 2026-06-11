@@ -96,7 +96,24 @@ It also exposes a first local-first Drive storage primitive outside the upstream
 - `POST /hermes/drive/objects`
 - `PUT /hermes/drive/objects/<id>`
 
-Objects are persisted in SQLite at `~/.local/share/hermes-warp-gateway/drive.sqlite` by default, or at `HERMES_WARP_GATEWAY_DB` for tests/deployments. This is not yet wired into the Warp client object model; it is the working self-hosted storage seam for the next compatibility layer.
+Objects are persisted in SQLite at `~/.local/share/hermes-warp-gateway/drive.sqlite` by default, or at `HERMES_WARP_GATEWAY_DB` / `--db` for tests/deployments. This is not yet wired into the Warp client object model; it is the working self-hosted storage seam for the next compatibility layer.
+
+The gateway can be configured with environment variables or CLI flags:
+- `HERMES_WARP_GATEWAY_HOST` / `--host`
+- `HERMES_WARP_GATEWAY_PORT` / `--port`
+- `HERMES_WARP_GATEWAY_DB` / `--db`
+- `HERMES_BASE_URL` / `--hermes-base-url`
+- `OPENAI_BASE_URL` / `--openai-base-url`
+- `HERMES_WARP_DEFAULT_MODEL` / `--default-model`
+- `--print-env` emits matching `WARP_*` launch exports.
+
+Gateway packaging/operator artifacts:
+- `script/run-hermes-warp-gateway`
+- `tools/hermes_warp_gateway.env.example`
+- `tools/hermes-warp-gateway.service`
+- `tools/hermes_warp_gateway.md`
+
+## Running gateway
 
 Run it locally:
 
@@ -118,9 +135,11 @@ script/verify-hermes-native
 
 This runs formatting, channel tests, `cargo check -p warp_core`, `cargo check -p warp`, gateway smoke checks for model/harness GraphQL responses, Drive object create/read/update/list smoke checks, and `git diff --check`.
 
+## Hermes harness polish
+`crates/warp_cli/src/agent.rs` now has a first-class `Harness::Hermes` selectable as `hermes` or `migi`. The app maps it through CLI-agent selection, display, setup readiness, local child task config, ambient-agent selection, and auth-secret bypass paths. Hermes is intentionally local-first and does not request Warp-managed harness secrets.
+
 ## Next implementation slices
 1. Replace the prototype gateway with a typed service and real GraphQL schema/resolvers backed by Hermes config/provider state.
-2. Add a first-class Hermes harness variant or adapter path that launches Hermes/Migi through a local/Tailscale service instead of Oz.
-3. Wire the Warp Drive/cloud-object client paths to the gateway's local object store; start with workflow/prompt read-write-list compatibility before notebooks/env vars.
-4. Patch session sharing to use the self-hosted relay and bind sessions to Herdr/Hermes session IDs.
-5. Add integration tests proving Hermes-native mode does not contact `*.warp.dev` for harness/model/session sharing paths.
+2. Wire the Warp Drive/cloud-object client paths to the gateway's local object store; start with workflow/prompt read-write-list compatibility before notebooks/env vars.
+3. Patch session sharing to use the self-hosted relay and bind sessions to Herdr/Hermes session IDs.
+4. Add integration tests proving Hermes-native mode does not contact `*.warp.dev` for harness/model/session sharing paths.
