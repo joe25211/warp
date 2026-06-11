@@ -82,8 +82,12 @@ with tempfile.TemporaryDirectory() as tmpdir:
         else:
             raise SystemExit('gateway did not become ready: ' + last)
 
-        def graphql(operation, query):
-            data = json.dumps({'operationName': operation, 'query': query}).encode()
+        def graphql(operation, query, variables=None):
+            data = json.dumps({
+                'operationName': operation,
+                'query': query,
+                'variables': variables or {},
+            }).encode()
             request = urllib.request.Request(
                 f'http://127.0.0.1:{port}/graphql/v2',
                 data=data,
@@ -124,6 +128,38 @@ with tempfile.TemporaryDirectory() as tmpdir:
         updated = request_json('PUT', f"/hermes/drive/objects/{created['id']}", {'content': 'echo updated'})['object']
         listed = request_json('GET', '/hermes/drive/objects?objectType=workflow')['objects']
 
+        gql_workflow = graphql(
+            'createWorkflow',
+            'mutation createWorkflow($input: CreateWorkflowInput!) { createWorkflow(input: $input) { __typename ... on CreateWorkflowOutput { revisionTs workflow { data metadata { uid revisionTs } } } } }',
+            {'input': {'data': json.dumps({'name': 'GQL workflow', 'command': 'echo gql'}), 'entrypoint': 'command'}},
+        )
+        gql_workflow_uid = gql_workflow['data']['createWorkflow']['workflow']['metadata']['uid']
+        gql_workflow_update = graphql(
+            'updateWorkflow',
+            'mutation updateWorkflow($input: UpdateWorkflowInput!) { updateWorkflow(input: $input) { __typename ... on UpdateWorkflowOutput { update { __typename ... on ObjectUpdateSuccess { revisionTs } } } } }',
+            {'input': {'uid': gql_workflow_uid, 'data': json.dumps({'name': 'GQL workflow', 'command': 'echo updated'})}},
+        )
+        gql_prompt = graphql(
+            'createGenericStringObject',
+            'mutation createGenericStringObject($input: CreateGenericStringObjectInput!) { createGenericStringObject(input: $input) { __typename ... on CreateGenericStringObjectOutput { clientId genericStringObject { format serializedModel metadata { uid revisionTs } } } } }',
+            {'input': {'genericStringObject': {'format': 'JsonAIFact', 'serializedModel': json.dumps({'name': 'Smoke prompt', 'prompt': 'summarize this'}), 'clientId': 'prompt-smoke'}}},
+        )
+        gql_prompt_uid = gql_prompt['data']['createGenericStringObject']['genericStringObject']['metadata']['uid']
+        gql_prompt_update = graphql(
+            'updateGenericStringObject',
+            'mutation updateGenericStringObject($input: UpdateGenericStringObjectInput!) { updateGenericStringObject(input: $input) { __typename ... on UpdateGenericStringObjectOutput { update { __typename ... on ObjectUpdateSuccess { revisionTs } } } } }',
+            {'input': {'uid': gql_prompt_uid, 'serializedModel': json.dumps({'name': 'Smoke prompt', 'prompt': 'summarize this now'})}},
+        )
+        gql_cloud_object = graphql(
+            'getCloudObject',
+            'query getCloudObject($input: CloudObjectInput!) { cloudObject(input: $input) { __typename ... on CloudObjectOutput { object { __typename ... on Workflow { data metadata { uid } } ... on GenericStringObject { serializedModel metadata { uid } } } } } }',
+            {'input': {'uid': gql_workflow_uid}},
+        )
+        gql_updated = graphql(
+            'getUpdatedCloudObjects',
+            'query getUpdatedCloudObjects { updatedCloudObjects { __typename ... on UpdatedCloudObjectsOutput { workflows { data metadata { uid } } genericStringObjects { format serializedModel metadata { uid } } deletedObjectUids { workflowUids genericStringObjectUids } } } }',
+        )
+
         assert health['ok'] is True
         assert 'warp.dev' not in json.dumps(harness).lower()
         assert 'Hermes / Migi' in json.dumps(harness)
@@ -132,6 +168,14 @@ with tempfile.TemporaryDirectory() as tmpdir:
         assert fetched['title'] == 'Smoke workflow'
         assert updated['revision'] == created['revision'] + 1
         assert any(obj['id'] == created['id'] for obj in listed)
+        assert gql_workflow_update['data']['updateWorkflow']['update']['__typename'] == 'ObjectUpdateSuccess'
+        assert gql_prompt['data']['createGenericStringObject']['clientId'] == 'prompt-smoke'
+        assert gql_prompt_update['data']['updateGenericStringObject']['update']['__typename'] == 'ObjectUpdateSuccess'
+        assert gql_cloud_object['data']['cloudObject']['object']['metadata']['uid'] == gql_workflow_uid
+        updated_payload = gql_updated['data']['updatedCloudObjects']
+        assert any(obj['metadata']['uid'] == gql_workflow_uid for obj in updated_payload['workflows'])
+        assert any(obj['metadata']['uid'] == gql_prompt_uid for obj in updated_payload['genericStringObjects'])
+        assert 'summarize this now' in json.dumps(updated_payload)
         print('gateway smoke ok')
     finally:
         proc.terminate()

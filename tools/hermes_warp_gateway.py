@@ -63,10 +63,21 @@ def _connect() -> sqlite3.Connection:
             owner TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            revision INTEGER NOT NULL
+            revision INTEGER NOT NULL,
+            format TEXT,
+            client_id TEXT,
+            entrypoint TEXT
         )
         """
     )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(drive_objects)")}
+    for column, ddl in {
+        "format": "ALTER TABLE drive_objects ADD COLUMN format TEXT",
+        "client_id": "ALTER TABLE drive_objects ADD COLUMN client_id TEXT",
+        "entrypoint": "ALTER TABLE drive_objects ADD COLUMN entrypoint TEXT",
+    }.items():
+        if column not in columns:
+            conn.execute(ddl)
     return conn
 
 
@@ -80,6 +91,9 @@ def _row_to_object(row: sqlite3.Row) -> dict[str, Any]:
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
         "revision": row["revision"],
+        "format": row["format"],
+        "clientId": row["client_id"],
+        "entrypoint": row["entrypoint"],
     }
 
 
@@ -107,14 +121,19 @@ def _create_drive_object(payload: dict[str, Any]) -> dict[str, Any]:
     content = str(payload.get("content") or "")
     owner = str(payload.get("owner") or "local")
     object_id = str(payload.get("id") or uuid.uuid4())
+    object_format = payload.get("format")
+    client_id = payload.get("clientId") or payload.get("client_id")
+    entrypoint = payload.get("entrypoint")
     timestamp = _now()
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO drive_objects (id, object_type, title, content, owner, created_at, updated_at, revision)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO drive_objects (
+                id, object_type, title, content, owner, created_at, updated_at, revision, format, client_id, entrypoint
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             """,
-            (object_id, object_type, title, content, owner, timestamp, timestamp),
+            (object_id, object_type, title, content, owner, timestamp, timestamp, object_format, client_id, entrypoint),
         )
     created = _get_drive_object(object_id)
     assert created is not None
@@ -129,15 +148,19 @@ def _update_drive_object(object_id: str, payload: dict[str, Any]) -> dict[str, A
     title = str(payload.get("title") or existing["title"])
     content = str(payload.get("content") if "content" in payload else existing["content"])
     owner = str(payload.get("owner") or existing["owner"])
+    object_format = payload.get("format") if "format" in payload else existing.get("format")
+    client_id = payload.get("clientId") or payload.get("client_id") or existing.get("clientId")
+    entrypoint = payload.get("entrypoint") or existing.get("entrypoint")
     timestamp = _now()
     with _connect() as conn:
         conn.execute(
             """
             UPDATE drive_objects
-            SET object_type = ?, title = ?, content = ?, owner = ?, updated_at = ?, revision = revision + 1
+            SET object_type = ?, title = ?, content = ?, owner = ?, updated_at = ?, revision = revision + 1,
+                format = ?, client_id = ?, entrypoint = ?
             WHERE id = ?
             """,
-            (object_type, title, content, owner, timestamp, object_id),
+            (object_type, title, content, owner, timestamp, object_format, client_id, entrypoint, object_id),
         )
     return _get_drive_object(object_id)
 
@@ -175,12 +198,291 @@ def _feature_model_choice() -> dict[str, Any]:
     }
 
 
+
+def _response_context() -> dict[str, Any]:
+    return {"serverVersion": "hermes-warp-gateway"}
+
+
+def _space() -> dict[str, Any]:
+    return {"__typename": "Space", "uid": "local", "type": "User"}
+
+
+def _metadata(obj: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "creatorUid": obj.get("owner") or "local",
+        "currentEditorUid": None,
+        "isWelcomeObject": False,
+        "lastEditorUid": obj.get("owner") or "local",
+        "metadataLastUpdatedTs": obj["updatedAt"],
+        "parent": _space(),
+        "revisionTs": obj["updatedAt"],
+        "trashedTs": None,
+        "uid": obj["id"],
+    }
+
+
+def _permissions(obj: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "guests": [],
+        "lastUpdatedTs": obj["updatedAt"],
+        "anyoneLinkSharing": None,
+        "space": _space(),
+    }
+
+
+def _workflow(obj: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "__typename": "Workflow",
+        "data": obj["content"],
+        "metadata": _metadata(obj),
+        "permissions": _permissions(obj),
+    }
+
+
+def _generic_string_object(obj: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "__typename": "GenericStringObject",
+        "format": obj.get("format") or "JsonWorkflowEnum",
+        "metadata": _metadata(obj),
+        "permissions": _permissions(obj),
+        "serializedModel": obj["content"],
+    }
+
+
+def _graphql_cloud_object(obj: dict[str, Any]) -> dict[str, Any]:
+    if obj["objectType"] == "workflow":
+        return _workflow(obj)
+    return _generic_string_object(obj)
+
+
+def _extract_title(serialized: str, fallback: str) -> str:
+    try:
+        data = json.loads(serialized)
+    except json.JSONDecodeError:
+        return fallback
+    if isinstance(data, dict):
+        for key in ("name", "title", "description"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return fallback
+
+
+def _variables(body: dict[str, Any]) -> dict[str, Any]:
+    variables = body.get("variables")
+    return variables if isinstance(variables, dict) else {}
+
+
+def _input(body: dict[str, Any]) -> dict[str, Any]:
+    value = _variables(body).get("input")
+    return value if isinstance(value, dict) else {}
+
+
+def _create_workflow_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
+    input_data = _input(body)
+    serialized = str(input_data.get("data") or "")
+    created = _create_drive_object(
+        {
+            "objectType": "workflow",
+            "title": _extract_title(serialized, "Untitled workflow"),
+            "content": serialized,
+            "owner": "local",
+            "entrypoint": input_data.get("entrypoint"),
+        }
+    )
+    return {
+        "data": {
+            "createWorkflow": {
+                "__typename": "CreateWorkflowOutput",
+                "responseContext": _response_context(),
+                "workflow": _workflow(created),
+                "revisionTs": created["updatedAt"],
+            }
+        }
+    }
+
+
+def _update_workflow_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
+    input_data = _input(body)
+    uid = str(input_data.get("uid") or "")
+    serialized = str(input_data.get("data") or "")
+    updated = _update_drive_object(
+        uid,
+        {
+            "objectType": "workflow",
+            "title": _extract_title(serialized, "Untitled workflow"),
+            "content": serialized,
+        },
+    )
+    if updated is None:
+        return _graphql_error("workflow not found", body)
+    return {
+        "data": {
+            "updateWorkflow": {
+                "__typename": "UpdateWorkflowOutput",
+                "responseContext": _response_context(),
+                "update": {
+                    "__typename": "ObjectUpdateSuccess",
+                    "lastEditorUid": updated.get("owner") or "local",
+                    "revisionTs": updated["updatedAt"],
+                },
+            }
+        }
+    }
+
+
+def _generic_payload_from_graphql(input_data: dict[str, Any]) -> dict[str, Any]:
+    gso = input_data.get("genericStringObject") or input_data.get("generic_string_object") or input_data
+    if not isinstance(gso, dict):
+        gso = {}
+    serialized = str(gso.get("serializedModel") or gso.get("serialized_model") or "")
+    object_format = str(gso.get("format") or "JsonWorkflowEnum")
+    return {
+        "id": str(gso.get("id") or uuid.uuid4()),
+        "objectType": "generic_string_object",
+        "title": _extract_title(serialized, object_format),
+        "content": serialized,
+        "owner": "local",
+        "format": object_format,
+        "clientId": gso.get("clientId") or gso.get("client_id"),
+        "entrypoint": gso.get("entrypoint"),
+    }
+
+
+def _create_gso_output(obj: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "__typename": "CreateGenericStringObjectOutput",
+        "clientId": obj.get("clientId") or obj["id"],
+        "genericStringObject": _generic_string_object(obj),
+        "responseContext": _response_context(),
+        "revisionTs": obj["updatedAt"],
+    }
+
+
+def _create_generic_string_object_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
+    created = _create_drive_object(_generic_payload_from_graphql(_input(body)))
+    return {
+        "data": {
+            "createGenericStringObject": {
+                "__typename": "CreateGenericStringObjectOutput",
+                "clientId": created.get("clientId") or created["id"],
+                "genericStringObject": _generic_string_object(created),
+                "responseContext": _response_context(),
+                "revisionTs": created["updatedAt"],
+            }
+        }
+    }
+
+
+def _bulk_create_objects_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
+    input_data = _input(body)
+    bulk = input_data.get("genericStringObjects") or input_data.get("generic_string_objects") or {}
+    if not isinstance(bulk, dict):
+        bulk = {}
+    objects = bulk.get("objects") if isinstance(bulk.get("objects"), list) else []
+    created = [_create_drive_object(_generic_payload_from_graphql(obj)) for obj in objects]
+    return {
+        "data": {
+            "bulkCreateObjects": {
+                "__typename": "BulkCreateObjectsOutput",
+                "genericStringObjects": {"objects": [_create_gso_output(obj) for obj in created]},
+                "responseContext": _response_context(),
+            }
+        }
+    }
+
+
+def _update_generic_string_object_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
+    input_data = _input(body)
+    uid = str(input_data.get("uid") or "")
+    serialized = str(input_data.get("serializedModel") or input_data.get("serialized_model") or "")
+    updated = _update_drive_object(
+        uid,
+        {
+            "objectType": "generic_string_object",
+            "title": _extract_title(serialized, "JsonWorkflowEnum"),
+            "content": serialized,
+        },
+    )
+    if updated is None:
+        return _graphql_error("generic string object not found", body)
+    return {
+        "data": {
+            "updateGenericStringObject": {
+                "__typename": "UpdateGenericStringObjectOutput",
+                "responseContext": _response_context(),
+                "update": {
+                    "__typename": "ObjectUpdateSuccess",
+                    "lastEditorUid": updated.get("owner") or "local",
+                    "revisionTs": updated["updatedAt"],
+                },
+            }
+        }
+    }
+
+
+def _updated_cloud_objects_from_graphql(_: dict[str, Any]) -> dict[str, Any]:
+    objects = _list_drive_objects()
+    workflows = [obj for obj in objects if obj["objectType"] == "workflow"]
+    generic_string_objects = [obj for obj in objects if obj["objectType"] == "generic_string_object"]
+    return {
+        "data": {
+            "updatedCloudObjects": {
+                "__typename": "UpdatedCloudObjectsOutput",
+                "actionHistories": [],
+                "deletedObjectUids": {
+                    "folderUids": [],
+                    "genericStringObjectUids": [],
+                    "notebookUids": [],
+                    "workflowUids": [],
+                },
+                "folders": [],
+                "genericStringObjects": [_generic_string_object(obj) for obj in generic_string_objects],
+                "mcpGallery": [],
+                "notebooks": [],
+                "responseContext": _response_context(),
+                "userProfiles": [],
+                "workflows": [_workflow(obj) for obj in workflows],
+            }
+        }
+    }
+
+
+def _cloud_object_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
+    uid = str(_input(body).get("uid") or "")
+    obj = _get_drive_object(uid)
+    if obj is None:
+        return _graphql_error("cloud object not found", body)
+    return {
+        "data": {
+            "cloudObject": {
+                "__typename": "CloudObjectOutput",
+                "object": _graphql_cloud_object(obj),
+                "actionHistories": [],
+                "responseContext": _response_context(),
+            }
+        }
+    }
+
+
+def _graphql_error(message: str, body: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "errors": [
+            {
+                "message": message,
+                "extensions": {"operationName": body.get("operationName") or ""},
+            }
+        ],
+        "data": None,
+    }
+
+
 def _graphql_response(body: dict[str, Any]) -> dict[str, Any]:
     query = body.get("query") or ""
     operation = body.get("operationName") or ""
-    needle = operation + "\n" + query
+    needle = (operation + "\n" + query).lower()
 
-    if "get_available_harnesses" in needle or "availableHarnesses" in needle:
+    if "get_available_harnesses" in needle or "availableharnesses" in needle:
         return {
             "data": {
                 "user": {
@@ -207,18 +509,18 @@ def _graphql_response(body: dict[str, Any]) -> dict[str, Any]:
             }
         }
 
-    if "free_available_models" in needle or "freeAvailableModels" in needle:
+    if "free_available_models" in needle or "freeavailablemodels" in needle:
         return {
             "data": {
                 "freeAvailableModels": {
                     "__typename": "FreeAvailableModelsOutput",
                     "featureModelChoice": _feature_model_choice(),
-                    "responseContext": {"clientMutationId": None},
+                    "responseContext": _response_context(),
                 }
             }
         }
 
-    if "get_feature_model_choices" in needle or "featureModelChoice" in needle:
+    if "get_feature_model_choices" in needle or "featuremodelchoice" in needle:
         return {
             "data": {
                 "user": {
@@ -228,16 +530,23 @@ def _graphql_response(body: dict[str, Any]) -> dict[str, Any]:
             }
         }
 
+    if "createworkflow" in needle or "create_workflow" in needle:
+        return _create_workflow_from_graphql(body)
+    if "updateworkflow" in needle or "update_workflow" in needle:
+        return _update_workflow_from_graphql(body)
+    if "creategenericstringobject" in needle or "create_generic_string_object" in needle:
+        return _create_generic_string_object_from_graphql(body)
+    if "bulkcreateobjects" in needle or "bulk_create_objects" in needle:
+        return _bulk_create_objects_from_graphql(body)
+    if "updategenericstringobject" in needle or "update_generic_string_object" in needle:
+        return _update_generic_string_object_from_graphql(body)
+    if "updatedcloudobjects" in needle or "get_updated_cloud_objects" in needle:
+        return _updated_cloud_objects_from_graphql(body)
+    if "cloudobject" in needle or "get_cloud_object" in needle:
+        return _cloud_object_from_graphql(body)
+
     # Safe default: do not fabricate successful cloud state for unknown resolvers.
-    return {
-        "errors": [
-            {
-                "message": "Hermes Warp gateway prototype has no resolver for this operation",
-                "extensions": {"operationName": operation},
-            }
-        ],
-        "data": None,
-    }
+    return _graphql_error("Hermes Warp gateway prototype has no resolver for this operation", body)
 
 
 class Handler(BaseHTTPRequestHandler):

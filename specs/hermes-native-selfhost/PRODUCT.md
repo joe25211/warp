@@ -31,7 +31,7 @@ Joe wants a Warp Terminal fork that keeps the useful terminal/workspace/Drive/se
 4. If Hermes-native mode is enabled but the server URL still points at `warp.dev`, harness refresh does not fetch Warp cloud harnesses.
 5. A launch script documents the local/Tailscale endpoint contract.
 6. A prototype gateway returns Hermes/Migi model/harness catalog responses without Warp cloud.
-7. The prototype gateway can create, read, update, and list local-first Drive-like objects in SQLite.
+7. The prototype gateway can create, read, update, and list local-first Drive-like objects in SQLite through both REST and first-pass GraphQL workflow/generic prompt-like object resolvers.
 8. Hermes/Migi is available as a first-class local harness option, including the `migi` alias.
 9. The gateway has a repo-local launch script, env example, user systemd unit, and operator docs.
 10. The docs cache under `~/.hermes/knowledge/warp-hermes-native/` records the Warp cloud/session/Drive docs used as source material.
@@ -39,6 +39,6 @@ Joe wants a Warp Terminal fork that keeps the useful terminal/workspace/Drive/se
 ## Later milestones
 - Replace the prototype `hermes-warp-gateway` with a typed service and GraphQL-compatible resolvers for login-free local workspace state, Drive object sync, harness catalog, and model list.
 - Replace Warp account/team assumptions with local workspace ACLs using Tailscale identity and/or Hermes profile identity.
-- Wire the Warp client cloud-object/Drive paths to the gateway's local object store.
+- Expand Drive compatibility beyond first-pass workflow/generic prompt-like objects into notebooks, env vars, folders, permissions, and deletion/conflict semantics.
 - Wire session sharing to Herdr panes/Migi session IDs and expose join/watch/steer links on the Tailscale dashboard.
 - Add migration/import for existing Warp Drive objects from local SQLite and/or exported files.

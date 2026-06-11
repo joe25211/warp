@@ -9,6 +9,9 @@ Current surface:
   - `get_available_harnesses` / `availableHarnesses`
   - `free_available_models` / `freeAvailableModels`
   - `get_feature_model_choices` / `featureModelChoice`
+  - `createWorkflow` / `updateWorkflow`
+  - `createGenericStringObject` / `bulkCreateObjects` / `updateGenericStringObject`
+  - `getCloudObject` / `getUpdatedCloudObjects`
 - Local-first Drive object seam:
   - `GET /hermes/drive/objects`
   - `GET /hermes/drive/objects?objectType=workflow`
@@ -89,7 +92,7 @@ Run the repo-local verification script:
 script/verify-hermes-native
 ```
 
-It formats the repo, checks the Rust app, starts the gateway on an isolated smoke-test port with a temporary SQLite database, verifies model/harness GraphQL responses, verifies Drive object create/read/update/list, and runs `git diff --check`.
+It formats the repo, checks the Rust app, starts the gateway on an isolated smoke-test port with a temporary SQLite database, verifies model/harness GraphQL responses, verifies REST Drive object create/read/update/list, verifies GraphQL workflow and generic prompt-like object create/read/update/list, and runs `git diff --check`.
 
 ## Next seams
 

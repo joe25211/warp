@@ -81,22 +81,18 @@ The gateway must eventually provide:
 
 ## Gateway prototype
 `tools/hermes_warp_gateway.py` is a stdlib-only prototype compatibility gateway. It serves:
-- `GET /healthz`
-- `POST /graphql/v2` for the first AI/model catalog resolvers:
-  - `get_available_harnesses` / `availableHarnesses`
-  - `free_available_models` / `freeAvailableModels`
-  - `get_feature_model_choices` / `featureModelChoice`
-
-It intentionally returns an error for unknown GraphQL operations instead of pretending to implement Warp cloud.
-
-It also exposes a first local-first Drive storage primitive outside the upstream Warp GraphQL schema:
+- `GET /healthz` and `GET /readyz`
+- `POST /graphql/v2` model/harness responses
+- `POST /graphql/v2` Drive compatibility responses for workflow and generic string objects:
+  - `createWorkflow` / `updateWorkflow`
+  - `createGenericStringObject` / `bulkCreateObjects` / `updateGenericStringObject`
+  - `getCloudObject` / `getUpdatedCloudObjects`
 - `GET /hermes/drive/objects`
-- `GET /hermes/drive/objects?objectType=workflow`
 - `GET /hermes/drive/objects/<id>`
 - `POST /hermes/drive/objects`
 - `PUT /hermes/drive/objects/<id>`
 
-Objects are persisted in SQLite at `~/.local/share/hermes-warp-gateway/drive.sqlite` by default, or at `HERMES_WARP_GATEWAY_DB` / `--db` for tests/deployments. This is not yet wired into the Warp client object model; it is the working self-hosted storage seam for the next compatibility layer.
+Objects are persisted in SQLite at `~/.local/share/hermes-warp-gateway/drive.sqlite` by default, or at `HERMES_WARP_GATEWAY_DB` / `--db` for tests/deployments. Workflow GraphQL mutations store `object_type=workflow`; generic string GraphQL mutations store `object_type=generic_string_object` and preserve `format`, `clientId`, and serialized prompt-like JSON payloads. This is the first wired compatibility layer for workflow/prompt-style Drive objects; it is still intentionally local-first and explicit-erroring for unknown resolvers.
 
 The gateway can be configured with environment variables or CLI flags:
 - `HERMES_WARP_GATEWAY_HOST` / `--host`
@@ -135,13 +131,13 @@ Verify the slice end-to-end:
 script/verify-hermes-native
 ```
 
-This runs formatting, channel tests, `cargo check -p warp_core`, `cargo check -p warp`, gateway smoke checks for model/harness GraphQL responses, Drive object create/read/update/list smoke checks, and `git diff --check`.
+This runs formatting, channel tests, `cargo check -p warp_core`, `cargo check -p warp`, gateway smoke checks for model/harness GraphQL responses, REST Drive object create/read/update/list, GraphQL workflow and generic prompt-like object create/read/update/list, and `git diff --check`.
 
 ## Hermes harness polish
 `crates/warp_cli/src/agent.rs` now has a first-class `Harness::Hermes` selectable as `hermes` or `migi`. The app maps it through CLI-agent selection, display, setup readiness, local child task config, ambient-agent selection, and auth-secret bypass paths. Hermes is intentionally local-first and does not request Warp-managed harness secrets.
 
 ## Next implementation slices
 1. Replace the prototype gateway with a typed service and real GraphQL schema/resolvers backed by Hermes config/provider state.
-2. Wire the Warp Drive/cloud-object client paths to the gateway's local object store; start with workflow/prompt read-write-list compatibility before notebooks/env vars.
-3. Patch session sharing to use the self-hosted relay and bind sessions to Herdr/Hermes session IDs.
+2. Patch session sharing to use the self-hosted relay and bind sessions to Herdr/Hermes session IDs.
+3. Expand Drive compatibility beyond workflow and generic prompt-like objects into notebooks, env vars, folders, permissions, and deletion/conflict semantics.
 4. Add integration tests proving Hermes-native mode does not contact `*.warp.dev` for harness/model/session sharing paths.
