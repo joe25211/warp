@@ -4,6 +4,7 @@ use std::time::Duration;
 use instant::Instant;
 use serde::{Deserialize, Serialize};
 use warp_cli::agent::Harness;
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_core::user_preferences::GetUserPreferences;
 use warp_managed_secrets::client::SecretOwner;
@@ -42,9 +43,17 @@ pub struct HarnessAvailability {
 }
 
 /// Default fallback used before the server responds.
-/// Oz is enabled by default so the UI is usable pre-fetch; the server
-/// list (which respects admin overrides) replaces this once available.
+///
+/// In normal Warp builds, Oz is enabled by default so the UI is usable pre-fetch; the server list
+/// (which respects admin overrides) replaces this once available. In Hermes-native self-host mode,
+/// never seed the UI with Warp-hosted Oz/cloud models. The self-hosted Hermes compatibility server
+/// must provide the harness list, or the UI should show no built-in cloud agent surface rather than
+/// silently falling back to Warp-hosted infrastructure.
 fn default_harnesses() -> Vec<HarnessAvailability> {
+    if Channel::hermes_native_mode_enabled() {
+        return vec![];
+    }
+
     vec![HarnessAvailability {
         harness: Harness::Oz,
         display_name: "Warp".to_string(),
@@ -103,7 +112,11 @@ pub struct HarnessAvailabilityModel {
 
 impl HarnessAvailabilityModel {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let harnesses = get_cached(ctx).unwrap_or_else(default_harnesses);
+        let harnesses = if Channel::hermes_native_mode_enabled() {
+            default_harnesses()
+        } else {
+            get_cached(ctx).unwrap_or_else(default_harnesses)
+        };
 
         ctx.subscribe_to_model(&NetworkStatus::handle(ctx), |me, event, ctx| {
             if let NetworkStatusEvent::NetworkStatusChanged {
@@ -339,6 +352,11 @@ impl HarnessAvailabilityModel {
     }
 
     pub fn refresh(&self, ctx: &mut ModelContext<Self>) {
+        let server_root_url = ChannelState::server_root_url();
+        if Channel::hermes_native_mode_enabled() && server_root_url.contains("warp.dev") {
+            return;
+        }
+
         // The endpoint queries `user`, which requires auth.
         if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             return;

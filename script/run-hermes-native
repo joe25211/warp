@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run the OSS Warp client in Hermes-native self-host mode.
+# Override these with Tailscale URLs when the gateway/relay is running off-host.
+export WARP_HERMES_NATIVE="${WARP_HERMES_NATIVE:-1}"
+export WARP_SERVER_ROOT_URL="${WARP_SERVER_ROOT_URL:-http://127.0.0.1:8976}"
+export WARP_WS_SERVER_URL="${WARP_WS_SERVER_URL:-ws://127.0.0.1:8976/graphql/v2}"
+export WARP_SESSION_SHARING_SERVER_URL="${WARP_SESSION_SHARING_SERVER_URL:-ws://127.0.0.1:8977}"
+
+printf 'Hermes-native Warp mode enabled\n' >&2
+printf '  WARP_SERVER_ROOT_URL=%s\n' "$WARP_SERVER_ROOT_URL" >&2
+printf '  WARP_WS_SERVER_URL=%s\n' "$WARP_WS_SERVER_URL" >&2
+printf '  WARP_SESSION_SHARING_SERVER_URL=%s\n' "$WARP_SESSION_SHARING_SERVER_URL" >&2
+
+exec cargo run --features with_local_server -- "$@"

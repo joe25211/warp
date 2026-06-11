@@ -595,8 +595,9 @@ pub fn run() -> Result<()> {
     // Parse command-line arguments.
     let args = warp_cli::Args::from_env();
 
-    // Server URL overrides are only honored on internal dev channels. Release channels silently
-    // ignore `--server-root-url` / `--ws-server-url` / `--session-sharing-server-url` (and their
+    // Server URL overrides are honored on internal dev channels and on OSS builds explicitly put
+    // into Hermes-native self-host mode. Official release channels silently ignore
+    // `--server-root-url` / `--ws-server-url` / `--session-sharing-server-url` (and their
     // `WARP_*` env-var equivalents) so shipped builds can't be redirected away from their
     // baked-in server URLs. See `Channel::allows_server_url_overrides`.
     if ChannelState::channel().allows_server_url_overrides() {

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+printf '%s\n' '== format =='
+./script/format
+
+printf '%s\n' '== warp_core channel tests =='
+cargo test -p warp_core channel:: -- --nocapture
+
+printf '%s\n' '== warp_core check =='
+cargo check -p warp_core
+
+printf '%s\n' '== app check =='
+cargo check -p warp
+
+printf '%s\n' '== gateway smoke =='
+python - <<'PY'
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    env = os.environ.copy()
+    env['HERMES_WARP_GATEWAY_DB'] = os.path.join(tmpdir, 'drive.sqlite')
+    proc = subprocess.Popen(
+        [sys.executable, 'tools/hermes_warp_gateway.py'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    try:
+        last = ''
+        for _ in range(50):
+            try:
+                with urllib.request.urlopen('http://127.0.0.1:8976/healthz', timeout=1) as response:
+                    health = json.load(response)
+                break
+            except Exception as exc:
+                last = repr(exc)
+                time.sleep(0.1)
+        else:
+            raise SystemExit('gateway did not become ready: ' + last)
+
+        def graphql(operation, query):
+            data = json.dumps({'operationName': operation, 'query': query}).encode()
+            request = urllib.request.Request(
+                'http://127.0.0.1:8976/graphql/v2',
+                data=data,
+                headers={'content-type': 'application/json'},
+                method='POST',
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return json.load(response)
+
+        def request_json(method, path, payload=None):
+            data = None if payload is None else json.dumps(payload).encode()
+            request = urllib.request.Request(
+                'http://127.0.0.1:8976' + path,
+                data=data,
+                headers={'content-type': 'application/json'},
+                method=method,
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return json.load(response)
+
+        harness = graphql(
+            'get_available_harnesses',
+            'query { user { __typename ... on UserOutput { user { availableHarnesses { harnesses { harness displayName enabled availableModels { id displayName reasoningLevel } } } } } } }',
+        )
+        models = graphql(
+            'free_available_models',
+            'query { freeAvailableModels { __typename ... on FreeAvailableModelsOutput { featureModelChoice { agentMode { defaultId choices { id displayName provider } } } } } }',
+        )
+        unknown = graphql('unknown_operation', 'query { unknown }')
+
+        created = request_json('POST', '/hermes/drive/objects', {
+            'objectType': 'workflow',
+            'title': 'Smoke workflow',
+            'content': 'echo hermes-warp-gateway',
+            'owner': 'local-test',
+        })['object']
+        fetched = request_json('GET', f"/hermes/drive/objects/{created['id']}")['object']
+        updated = request_json('PUT', f"/hermes/drive/objects/{created['id']}", {'content': 'echo updated'})['object']
+        listed = request_json('GET', '/hermes/drive/objects?objectType=workflow')['objects']
+
+        assert health['ok'] is True
+        assert 'warp.dev' not in json.dumps(harness).lower()
+        assert 'Hermes / Migi' in json.dumps(harness)
+        assert 'Hermes / Migi' in json.dumps(models)
+        assert unknown.get('errors'), unknown
+        assert fetched['title'] == 'Smoke workflow'
+        assert updated['revision'] == created['revision'] + 1
+        assert any(obj['id'] == created['id'] for obj in listed)
+        print('gateway smoke ok')
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+PY
+
+printf '%s\n' '== diff hygiene =='
+git diff --check
+
+printf '%s\n' 'Hermes-native verification passed.'

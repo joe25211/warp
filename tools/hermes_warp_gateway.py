@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Tiny Hermes-native Warp compatibility gateway prototype.
+
+This is not the final service. It is a stdlib-only executable seam that lets the fork point
+`WARP_SERVER_ROOT_URL` / `WARP_WS_SERVER_URL` at Joe-controlled infrastructure and receive a
+non-Warp-cloud harness/model catalog while the real Hermes gateway is built.
+
+It also exposes a minimal local-first Drive object store under `/hermes/drive/objects`. That route
+is intentionally outside Warp's upstream GraphQL schema for now: it gives Migi a working self-hosted
+storage primitive while the exact Warp Drive GraphQL compatibility layer is mapped.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+HOST = os.environ.get("HERMES_WARP_GATEWAY_HOST", "127.0.0.1")
+PORT = int(os.environ.get("HERMES_WARP_GATEWAY_PORT", "8976"))
+HERMES_BASE_URL = os.environ.get("HERMES_BASE_URL", "http://127.0.0.1:9120")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8787/v1")
+DEFAULT_MODEL = os.environ.get("HERMES_WARP_DEFAULT_MODEL", "hermes/migi-default")
+DB_PATH = Path(
+    os.environ.get(
+        "HERMES_WARP_GATEWAY_DB",
+        str(Path.home() / ".local/share/hermes-warp-gateway/drive.sqlite"),
+    )
+)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS drive_objects (
+            id TEXT PRIMARY KEY,
+            object_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            revision INTEGER NOT NULL
+        )
+        """
+    )
+    return conn
+
+
+def _row_to_object(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "objectType": row["object_type"],
+        "title": row["title"],
+        "content": row["content"],
+        "owner": row["owner"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "revision": row["revision"],
+    }
+
+
+def _list_drive_objects(object_type: str | None = None) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        if object_type:
+            rows = conn.execute(
+                "SELECT * FROM drive_objects WHERE object_type = ? ORDER BY updated_at DESC",
+                (object_type,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM drive_objects ORDER BY updated_at DESC").fetchall()
+    return [_row_to_object(row) for row in rows]
+
+
+def _get_drive_object(object_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM drive_objects WHERE id = ?", (object_id,)).fetchone()
+    return _row_to_object(row) if row else None
+
+
+def _create_drive_object(payload: dict[str, Any]) -> dict[str, Any]:
+    object_type = str(payload.get("objectType") or payload.get("object_type") or "prompt")
+    title = str(payload.get("title") or "Untitled")
+    content = str(payload.get("content") or "")
+    owner = str(payload.get("owner") or "local")
+    object_id = str(payload.get("id") or uuid.uuid4())
+    timestamp = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO drive_objects (id, object_type, title, content, owner, created_at, updated_at, revision)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (object_id, object_type, title, content, owner, timestamp, timestamp),
+        )
+    created = _get_drive_object(object_id)
+    assert created is not None
+    return created
+
+
+def _update_drive_object(object_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    existing = _get_drive_object(object_id)
+    if existing is None:
+        return None
+    object_type = str(payload.get("objectType") or payload.get("object_type") or existing["objectType"])
+    title = str(payload.get("title") or existing["title"])
+    content = str(payload.get("content") if "content" in payload else existing["content"])
+    owner = str(payload.get("owner") or existing["owner"])
+    timestamp = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE drive_objects
+            SET object_type = ?, title = ?, content = ?, owner = ?, updated_at = ?, revision = revision + 1
+            WHERE id = ?
+            """,
+            (object_type, title, content, owner, timestamp, object_id),
+        )
+    return _get_drive_object(object_id)
+
+
+def _llm_info(model_id: str = DEFAULT_MODEL) -> dict[str, Any]:
+    return {
+        "displayName": "Hermes / Migi self-hosted",
+        "baseModelName": model_id,
+        "id": model_id,
+        "reasoningLevel": None,
+        "usageMetadata": {"creditMultiplier": None, "requestMultiplier": 0},
+        "description": f"Joe-controlled Hermes provider catalog via {OPENAI_BASE_URL}",
+        "disableReason": None,
+        "visionSupported": True,
+        "spec": {"cost": 0.0, "quality": 0.8, "speed": 0.8},
+        "provider": "Unknown",
+        "hostConfigs": [{"enabled": True, "modelRoutingHost": "CustomEndpoint"}],
+        "pricing": {"discountPercentage": None},
+        "contextWindow": {"isConfigurable": True, "min": 1024, "max": 262144, "default": 65536},
+    }
+
+
+def _feature_model_choice() -> dict[str, Any]:
+    available = {
+        "defaultId": DEFAULT_MODEL,
+        "choices": [_llm_info()],
+        "preferredCodexModelId": None,
+    }
+    return {
+        "agentMode": available,
+        "planning": available,
+        "coding": available,
+        "cliAgent": available,
+        "computerUseAgent": available,
+    }
+
+
+def _graphql_response(body: dict[str, Any]) -> dict[str, Any]:
+    query = body.get("query") or ""
+    operation = body.get("operationName") or ""
+    needle = operation + "\n" + query
+
+    if "get_available_harnesses" in needle or "availableHarnesses" in needle:
+        return {
+            "data": {
+                "user": {
+                    "__typename": "UserOutput",
+                    "user": {
+                        "availableHarnesses": {
+                            "harnesses": [
+                                {
+                                    "harness": "ClaudeCode",
+                                    "displayName": "Hermes / Migi local agent",
+                                    "enabled": True,
+                                    "availableModels": [
+                                        {
+                                            "id": DEFAULT_MODEL,
+                                            "displayName": "Hermes / Migi self-hosted",
+                                            "reasoningLevel": None,
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    },
+                }
+            }
+        }
+
+    if "free_available_models" in needle or "freeAvailableModels" in needle:
+        return {
+            "data": {
+                "freeAvailableModels": {
+                    "__typename": "FreeAvailableModelsOutput",
+                    "featureModelChoice": _feature_model_choice(),
+                    "responseContext": {"clientMutationId": None},
+                }
+            }
+        }
+
+    if "get_feature_model_choices" in needle or "featureModelChoice" in needle:
+        return {
+            "data": {
+                "user": {
+                    "__typename": "UserOutput",
+                    "user": {"workspaces": [{"featureModelChoice": _feature_model_choice()}]},
+                }
+            }
+        }
+
+    # Safe default: do not fabricate successful cloud state for unknown resolvers.
+    return {
+        "errors": [
+            {
+                "message": "Hermes Warp gateway prototype has no resolver for this operation",
+                "extensions": {"operationName": operation},
+            }
+        ],
+        "data": None,
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "hermes-warp-gateway/0.1"
+
+    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("content-length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8"))
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+        parsed = urlparse(self.path)
+        if parsed.path in {"/", "/healthz", "/readyz"}:
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "service": "hermes-warp-gateway",
+                    "hermesBaseUrl": HERMES_BASE_URL,
+                    "openaiBaseUrl": OPENAI_BASE_URL,
+                    "defaultModel": DEFAULT_MODEL,
+                    "driveDbPath": str(DB_PATH),
+                },
+            )
+            return
+
+        if parsed.path == "/hermes/drive/objects":
+            params = parse_qs(parsed.query)
+            self._send_json(200, {"objects": _list_drive_objects(params.get("objectType", [None])[0])})
+            return
+
+        if parsed.path.startswith("/hermes/drive/objects/"):
+            object_id = parsed.path.rsplit("/", 1)[-1]
+            found = _get_drive_object(object_id)
+            if found is None:
+                self._send_json(404, {"error": "drive object not found"})
+            else:
+                self._send_json(200, {"object": found})
+            return
+
+        self._send_json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/graphql/v2"):
+            try:
+                body = self._read_json()
+            except Exception as exc:  # pragma: no cover - defensive gateway edge
+                self._send_json(400, {"error": f"invalid json: {exc}"})
+                return
+            self._send_json(200, _graphql_response(body))
+            return
+
+        if parsed.path == "/hermes/drive/objects":
+            try:
+                self._send_json(201, {"object": _create_drive_object(self._read_json())})
+            except Exception as exc:  # pragma: no cover - defensive gateway edge
+                self._send_json(400, {"error": f"invalid drive object: {exc}"})
+            return
+
+        self._send_json(404, {"error": "not found"})
+
+    def do_PUT(self) -> None:  # noqa: N802 - stdlib handler API
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/hermes/drive/objects/"):
+            object_id = parsed.path.rsplit("/", 1)[-1]
+            try:
+                updated = _update_drive_object(object_id, self._read_json())
+            except Exception as exc:  # pragma: no cover - defensive gateway edge
+                self._send_json(400, {"error": f"invalid drive object update: {exc}"})
+                return
+            if updated is None:
+                self._send_json(404, {"error": "drive object not found"})
+            else:
+                self._send_json(200, {"object": updated})
+            return
+
+        self._send_json(404, {"error": "not found"})
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"{self.address_string()} - {format % args}")
+
+
+def main() -> None:
+    _connect().close()
+    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"hermes-warp-gateway listening on http://{HOST}:{PORT}")
+    print(f"drive db: {DB_PATH}")
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
