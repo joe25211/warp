@@ -35,7 +35,11 @@ except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
     )
 
 if health.get("service") != "hermes-warp-gateway":
-    print(f"warning: {health_url} did not identify as hermes-warp-gateway", file=sys.stderr)
+    raise SystemExit(
+        f"{health_url} did not identify as hermes-warp-gateway; "
+        "check WARP_SERVER_ROOT_URL or set "
+        "WARP_HERMES_NATIVE_SKIP_GATEWAY_CHECK=1 to bypass this guard."
+    )
 PY
 fi
 

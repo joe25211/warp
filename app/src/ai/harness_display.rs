@@ -89,6 +89,7 @@ impl From<AIAgentHarness> for Harness {
             AIAgentHarness::ClaudeCode => Harness::Claude,
             AIAgentHarness::Gemini => Harness::Gemini,
             AIAgentHarness::Codex => Harness::Codex,
+            AIAgentHarness::Hermes => Harness::Hermes,
             AIAgentHarness::Unknown => Harness::Unknown,
         }
     }

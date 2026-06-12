@@ -32,6 +32,7 @@ HERMES_BASE_URL = os.environ.get("HERMES_BASE_URL", "http://127.0.0.1:9120")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8787/v1")
 DEFAULT_MODEL = os.environ.get("HERMES_WARP_DEFAULT_MODEL", "hermes/migi-default")
 SESSION_SHARING_URL = os.environ.get("WARP_SESSION_SHARING_SERVER_URL", "ws://127.0.0.1:8976")
+MAX_WS_FRAME_BYTES = 1 << 20  # 1 MiB; enough for relay control frames, bounded for LAN/Tailscale abuse.
 DB_PATH = Path(
     os.environ.get(
         "HERMES_WARP_GATEWAY_DB",
@@ -561,21 +562,38 @@ def _websocket_accept_key(key: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
+def _read_exact(rfile: Any, size: int) -> bytes | None:
+    data = rfile.read(size)
+    return data if len(data) == size else None
+
+
 def _read_ws_text(rfile: Any, wfile: Any | None = None) -> str | None:
     while True:
-        header = rfile.read(2)
-        if len(header) < 2:
+        header = _read_exact(rfile, 2)
+        if header is None:
             return None
         first, second = header
         opcode = first & 0x0F
         masked = bool(second & 0x80)
         length = second & 0x7F
         if length == 126:
-            length = struct.unpack("!H", rfile.read(2))[0]
+            extended = _read_exact(rfile, 2)
+            if extended is None:
+                return None
+            length = struct.unpack("!H", extended)[0]
         elif length == 127:
-            length = struct.unpack("!Q", rfile.read(8))[0]
-        mask = rfile.read(4) if masked else b""
-        payload = rfile.read(length) if length else b""
+            extended = _read_exact(rfile, 8)
+            if extended is None:
+                return None
+            length = struct.unpack("!Q", extended)[0]
+        if length > MAX_WS_FRAME_BYTES:
+            return None
+        mask = _read_exact(rfile, 4) if masked else b""
+        if mask is None:
+            return None
+        payload = _read_exact(rfile, length) if length else b""
+        if payload is None:
+            return None
         if masked:
             payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
         if opcode == 0x8:
@@ -588,7 +606,10 @@ def _read_ws_text(rfile: Any, wfile: Any | None = None) -> str | None:
             continue
         if opcode != 0x1:
             return ""
-        return payload.decode("utf-8")
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return ""
 
 
 def _write_ws_text(wfile: Any, text: str) -> None:
@@ -668,7 +689,8 @@ def _update_drive_object(object_id: str, payload: dict[str, Any]) -> dict[str, A
     return _get_drive_object(object_id)
 
 
-def _llm_info(model_id: str = DEFAULT_MODEL) -> dict[str, Any]:
+def _llm_info(model_id: str | None = None) -> dict[str, Any]:
+    model_id = model_id or DEFAULT_MODEL
     return {
         "displayName": "Hermes / Migi self-hosted",
         "baseModelName": model_id,
@@ -680,7 +702,7 @@ def _llm_info(model_id: str = DEFAULT_MODEL) -> dict[str, Any]:
         "visionSupported": True,
         "spec": {"cost": 0.0, "quality": 0.8, "speed": 0.8},
         "provider": "Unknown",
-        "hostConfigs": [{"enabled": True, "modelRoutingHost": "CustomEndpoint"}],
+        "hostConfigs": [{"enabled": True, "modelRoutingHost": "CUSTOM_ENDPOINT"}],
         "pricing": {"discountPercentage": None},
         "contextWindow": {"isConfigurable": True, "min": 1024, "max": 262144, "default": 65536},
     }
@@ -689,7 +711,7 @@ def _llm_info(model_id: str = DEFAULT_MODEL) -> dict[str, Any]:
 def _feature_model_choice() -> dict[str, Any]:
     available = {
         "defaultId": DEFAULT_MODEL,
-        "choices": [_llm_info()],
+        "choices": [_llm_info(DEFAULT_MODEL)],
         "preferredCodexModelId": None,
     }
     return {
@@ -968,6 +990,26 @@ def _cloud_object_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _create_agent_task_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
+    input_data = dict(_input(body))
+    task_id = str(uuid.uuid4())
+    input_data["taskId"] = task_id
+    input_data.setdefault("taskState", "CLAIMED")
+    try:
+        task = _upsert_agent_task(input_data)
+    except ValueError as exc:
+        return _graphql_error(str(exc), body)
+    return {
+        "data": {
+            "createAgentTask": {
+                "__typename": "CreateAgentTaskOutput",
+                "responseContext": _response_context(),
+                "taskId": task["taskId"],
+            }
+        }
+    }
+
+
 def _update_agent_task_from_graphql(body: dict[str, Any]) -> dict[str, Any]:
     try:
         task = _upsert_agent_task(_input(body))
@@ -1012,7 +1054,7 @@ def _graphql_response(body: dict[str, Any]) -> dict[str, Any]:
                         "availableHarnesses": {
                             "harnesses": [
                                 {
-                                    "harness": "ClaudeCode",
+                                    "harness": "HERMES",
                                     "displayName": "Hermes / Migi local agent",
                                     "enabled": True,
                                     "availableModels": [
@@ -1063,6 +1105,8 @@ def _graphql_response(body: dict[str, Any]) -> dict[str, Any]:
         return _update_generic_string_object_from_graphql(body)
     if "updatedcloudobjects" in needle or "get_updated_cloud_objects" in needle:
         return _updated_cloud_objects_from_graphql(body)
+    if "createagenttask" in needle or "create_agent_task" in needle:
+        return _create_agent_task_from_graphql(body)
     if "updateagenttask" in needle or "update_agent_task" in needle:
         return _update_agent_task_from_graphql(body)
     if "cloudobject" in needle or "get_cloud_object" in needle:
@@ -1424,6 +1468,15 @@ class Handler(BaseHTTPRequestHandler):
         print(f"{self.address_string()} - {format % args}")
 
 
+def _normalize_session_sharing_url(value: str, parser: argparse.ArgumentParser) -> str:
+    parsed = urlparse(value)
+    if parsed.path not in {"", "/"}:
+        parser.error("--session-sharing-url must not include a path; use the gateway base ws://host:port")
+    if parsed.scheme not in {"ws", "wss"} or not parsed.netloc:
+        parser.error("--session-sharing-url must be a ws:// or wss:// gateway base URL")
+    return value.rstrip("/")
+
+
 def main() -> None:
     global HOST, PORT, HERMES_BASE_URL, OPENAI_BASE_URL, DEFAULT_MODEL, SESSION_SHARING_URL, DB_PATH
 
@@ -1463,7 +1516,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--session-sharing-url",
-        default=SESSION_SHARING_URL,
+        default=None,
         help="self-host/Tailscale session sharing URL exported for Warp launch",
     )
     parser.add_argument(
@@ -1478,7 +1531,12 @@ def main() -> None:
     HERMES_BASE_URL = args.hermes_base_url
     OPENAI_BASE_URL = args.openai_base_url
     DEFAULT_MODEL = args.default_model
-    SESSION_SHARING_URL = args.session_sharing_url
+    if args.session_sharing_url is not None:
+        SESSION_SHARING_URL = _normalize_session_sharing_url(args.session_sharing_url, parser)
+    elif "WARP_SESSION_SHARING_SERVER_URL" in os.environ:
+        SESSION_SHARING_URL = _normalize_session_sharing_url(SESSION_SHARING_URL, parser)
+    else:
+        SESSION_SHARING_URL = f"ws://{HOST}:{PORT}"
     DB_PATH = Path(args.db).expanduser()
 
     if args.print_env:

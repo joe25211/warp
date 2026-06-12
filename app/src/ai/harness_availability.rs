@@ -357,8 +357,12 @@ impl HarnessAvailabilityModel {
             return;
         }
 
-        // The endpoint queries `user`, which requires auth.
-        if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
+        // Normal Warp cloud `user` queries require auth. In Hermes-native self-host mode the
+        // compatibility gateway serves the same shape locally so the harness picker can populate
+        // before any Warp login exists.
+        if !Channel::hermes_native_mode_enabled()
+            && !AuthStateProvider::as_ref(ctx).get().is_logged_in()
+        {
             return;
         }
 

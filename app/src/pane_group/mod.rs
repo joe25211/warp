@@ -3709,6 +3709,7 @@ impl PaneGroup {
                     AIAgentHarness::ClaudeCode => Some(Harness::Claude),
                     AIAgentHarness::Gemini => Some(Harness::Gemini),
                     AIAgentHarness::Codex => Some(Harness::Codex),
+                    AIAgentHarness::Hermes => Some(Harness::Hermes),
                     AIAgentHarness::Oz => None,
                     AIAgentHarness::Unknown => Some(Harness::Unknown),
                 };
@@ -5318,6 +5319,7 @@ impl PaneGroup {
                         AIAgentHarness::ClaudeCode => Some(Harness::Claude),
                         AIAgentHarness::Gemini => Some(Harness::Gemini),
                         AIAgentHarness::Codex => Some(Harness::Codex),
+                        AIAgentHarness::Hermes => Some(Harness::Hermes),
                         AIAgentHarness::Oz => None,
                         AIAgentHarness::Unknown => Some(Harness::Unknown),
                     };
