@@ -27,6 +27,10 @@ Current surface:
   - `GET /hermes/sessions/<session_id>/events` lists ordered session events
   - `POST /hermes/sessions/<session_id>/events` appends terminal/agent events
   - `GET /hermes/sessions/<session_id>/events/stream?once=1` emits the event backlog as SSE
+  - WebSocket relay adapter routes on `WARP_SESSION_SHARING_SERVER_URL`:
+    - `/sessions/create` creates a local relay record, returns session/reconnect credentials, journals initialization, and accepts ping/terminal-event upstream messages
+    - `/sessions/<session_id>/resume` validates the reconnect token and returns the latest processed terminal event number
+    - `/sessions/join/<session_id>` is explicitly handled and journals viewer attempts, but returns `FailedToJoin` until downstream event fanout is implemented
   - `GET /session/<session_id>` renders a small public-safe local handoff page
 
 Unknown GraphQL operations return an explicit error. The gateway should not fabricate Warp cloud state.
@@ -85,13 +89,13 @@ Check it:
 curl -fsS http://127.0.0.1:8976/healthz | python3 -m json.tool
 ```
 
-For Tailscale LAN serving, set `HERMES_WARP_GATEWAY_HOST=0.0.0.0` and use the node DNS name in the Warp client env:
+For Tailscale LAN serving, set `HERMES_WARP_GATEWAY_HOST=0.0.0.0` and use the node DNS name in the Warp client env. Keep `WARP_SESSION_SHARING_SERVER_URL` without a trailing slash because Warp's session-sharing client appends route paths such as `/sessions/create`.
 
 ```bash
 export WARP_HERMES_NATIVE=1
 export WARP_SERVER_ROOT_URL=http://tower.tailb0557b.ts.net:8976
 export WARP_WS_SERVER_URL=ws://tower.tailb0557b.ts.net:8976/graphql/v2
-export WARP_SESSION_SHARING_SERVER_URL=ws://tower.tailb0557b.ts.net:8977
+export WARP_SESSION_SHARING_SERVER_URL=ws://tower.tailb0557b.ts.net:8976
 ```
 
 ## Verification
@@ -102,10 +106,11 @@ Run the repo-local verification script:
 script/verify-hermes-native
 ```
 
-It formats the repo, checks the Rust app, starts the gateway on an isolated smoke-test port with a temporary SQLite database, verifies model/harness GraphQL responses, verifies REST Drive object create/read/update/list, verifies GraphQL workflow and generic prompt-like object create/read/update/list, verifies `updateAgentTask` task/session binding, verifies session event journal append/list/SSE backlog behavior, verifies `/hermes/sessions/<id>` and `/session/<id>`, and runs `git diff --check`.
+It formats the repo, checks the Rust app, starts the gateway on an isolated smoke-test port with a temporary SQLite database, verifies model/harness GraphQL responses, verifies REST Drive object create/read/update/list, verifies GraphQL workflow and generic prompt-like object create/read/update/list, verifies `updateAgentTask` task/session binding, verifies session event journal append/list/SSE backlog behavior, verifies the WebSocket relay adapter for `/sessions/create`, reconnect-token-gated `/sessions/<id>/resume`, and explicit `/sessions/join/<id>` failure handling, verifies `/hermes/sessions/<id>` and `/session/<id>`, and runs `git diff --check`.
 
 ## Next seams
 
 - Replace the prototype GraphQL string router with typed resolvers backed by Hermes config/provider state.
 - Patch the client cloud-object paths to use the Drive object compatibility layer.
-- Bridge the session event journal v0 into a protocol-compatible `/sessions/create`, `/sessions/join/<id>`, and `/sessions/<id>/resume` relay on the `WARP_SESSION_SHARING_SERVER_URL` seam.
+- Add downstream viewer fanout plus scrollback/event catch-up over the session relay.
+- Bind participant state/ACLs to Herdr/Hermes session identity and expose dashboard join/watch/steer links.

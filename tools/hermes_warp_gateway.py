@@ -12,10 +12,13 @@ storage primitive while the exact Warp Drive GraphQL compatibility layer is mapp
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import html
 import json
 import os
 import sqlite3
+import struct
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,7 +31,7 @@ PORT = int(os.environ.get("HERMES_WARP_GATEWAY_PORT", "8976"))
 HERMES_BASE_URL = os.environ.get("HERMES_BASE_URL", "http://127.0.0.1:9120")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8787/v1")
 DEFAULT_MODEL = os.environ.get("HERMES_WARP_DEFAULT_MODEL", "hermes/migi-default")
-SESSION_SHARING_URL = os.environ.get("WARP_SESSION_SHARING_SERVER_URL", "ws://127.0.0.1:8977")
+SESSION_SHARING_URL = os.environ.get("WARP_SESSION_SHARING_SERVER_URL", "ws://127.0.0.1:8976")
 DB_PATH = Path(
     os.environ.get(
         "HERMES_WARP_GATEWAY_DB",
@@ -110,6 +113,20 @@ def _connect() -> sqlite3.Connection:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_session_id_event_id "
         "ON session_events(session_id, event_id)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_relays (
+            session_id TEXT PRIMARY KEY,
+            session_secret TEXT NOT NULL,
+            reconnect_token TEXT NOT NULL,
+            sharer_id TEXT NOT NULL,
+            sharer_firebase_uid TEXT NOT NULL,
+            last_event_no INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
     )
     return conn
 
@@ -300,6 +317,198 @@ def _event_limit(value: str | None) -> int:
     return max(1, min(limit, 1000))
 
 
+def _event_after(value: str | None) -> int:
+    try:
+        after = int(value or "0")
+    except ValueError:
+        after = 0
+    return max(0, after)
+
+
+def _row_to_session_relay(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "sessionId": row["session_id"],
+        "sharerId": row["sharer_id"],
+        "sharerFirebaseUid": row["sharer_firebase_uid"],
+        "lastEventNo": row["last_event_no"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def _get_session_relay(session_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM session_relays WHERE session_id = ?", (session_id,)).fetchone()
+    return _row_to_session_relay(row) if row else None
+
+
+def _get_session_relay_private(session_id: str) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute("SELECT * FROM session_relays WHERE session_id = ?", (session_id,)).fetchone()
+
+
+def _delete_session_relay(session_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM session_relays WHERE session_id = ?", (session_id,))
+
+
+def _create_session_relay() -> dict[str, str]:
+    timestamp = _now()
+    relay = {
+        "sessionId": str(uuid.uuid4()),
+        "sessionSecret": str(uuid.uuid4()),
+        "reconnectToken": str(uuid.uuid4()),
+        "sharerId": str(uuid.uuid4()),
+        "sharerFirebaseUid": "local-sharer",
+    }
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO session_relays (
+                session_id, session_secret, reconnect_token, sharer_id, sharer_firebase_uid,
+                last_event_no, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                relay["sessionId"],
+                relay["sessionSecret"],
+                relay["reconnectToken"],
+                relay["sharerId"],
+                relay["sharerFirebaseUid"],
+                None,
+                timestamp,
+                timestamp,
+            ),
+        )
+    return relay
+
+
+def _relay_field(relay: dict[str, Any] | sqlite3.Row, dict_key: str, row_key: str) -> Any:
+    if isinstance(relay, dict):
+        return relay[dict_key]
+    return relay[row_key]
+
+
+def _participant_info(participant_id: str, firebase_uid: str, display_name: str) -> dict[str, Any]:
+    return {
+        "id": participant_id,
+        "profile_data": {
+            "firebase_uid": firebase_uid,
+            "display_name": display_name,
+            "photo_url": None,
+            "email": None,
+            "input_replica_id": "",
+        },
+        "selection": "None",
+    }
+
+
+def _relay_participant_list(relay: dict[str, Any] | sqlite3.Row) -> dict[str, Any]:
+    sharer_id = str(_relay_field(relay, "sharerId", "sharer_id"))
+    firebase_uid = str(_relay_field(relay, "sharerFirebaseUid", "sharer_firebase_uid"))
+    return {
+        "sharer": {"info": _participant_info(sharer_id, firebase_uid, "Hermes local sharer")},
+        "viewers": [],
+        "present_viewers": [],
+        "absent_viewers": [],
+        "guests": [],
+        "pending_guests": [],
+    }
+
+
+def _update_relay_last_event(session_id: str, event_no: int | None) -> None:
+    if event_no is None:
+        return
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE session_relays
+            SET last_event_no = CASE
+                    WHEN last_event_no IS NULL OR ? > last_event_no THEN ?
+                    ELSE last_event_no
+                END,
+                updated_at = ?
+            WHERE session_id = ?
+            """,
+            (event_no, event_no, _now(), session_id),
+        )
+
+
+def _relay_message_summary(raw_message: str) -> dict[str, Any]:
+    try:
+        message = json.loads(raw_message)
+    except json.JSONDecodeError:
+        return {"variant": "invalid-json", "bytes": len(raw_message)}
+    if not isinstance(message, dict) or not message:
+        return {"variant": "unknown", "shape": type(message).__name__}
+    variant = next(iter(message.keys()))
+    value = message.get(variant)
+    summary: dict[str, Any] = {"variant": variant}
+    if isinstance(value, dict):
+        summary["fields"] = sorted(value.keys())
+        if variant == "OrderedTerminalEvent":
+            event_no = value.get("event_no")
+            if type(event_no) is int and event_no >= 0:
+                summary["eventNo"] = event_no
+        if variant == "Initialize":
+            source_task_id = value.get("source_task_id")
+            if source_task_id:
+                summary["sourceTaskId"] = source_task_id
+    return summary
+
+
+def _parse_relay_message(raw_message: str) -> dict[str, Any] | None:
+    try:
+        message = json.loads(raw_message)
+    except json.JSONDecodeError:
+        return None
+    return message if isinstance(message, dict) else None
+
+
+def _extract_ordered_event_no(raw_message: str) -> int | None:
+    message = _parse_relay_message(raw_message)
+    if message is None:
+        return None
+    event = message.get("OrderedTerminalEvent")
+    if isinstance(event, dict):
+        event_no = event.get("event_no")
+        if type(event_no) is int and event_no >= 0:
+            return event_no
+    return None
+
+
+def _is_initialize_message(raw_message: str) -> bool:
+    message = _parse_relay_message(raw_message)
+    if message is None or set(message.keys()) != {"Initialize"}:
+        return False
+    return isinstance(message.get("Initialize"), dict)
+
+
+def _failed_to_initialize_message(details: str) -> str:
+    return json.dumps(
+        {
+            "FailedToInitializeSession": {
+                "reason": {"InternalServerError": {"details": details}}
+            }
+        },
+        separators=(",", ":"),
+    )
+
+
+def _failed_to_reconnect_message(reason: str) -> str:
+    return json.dumps({"FailedToReconnect": {"reason": reason}}, separators=(",", ":"))
+
+
+def _extract_reconnect_token(raw_message: str) -> str | None:
+    message = _parse_relay_message(raw_message)
+    reconnect = message.get("Reconnect") if message else None
+    if isinstance(reconnect, dict):
+        token = reconnect.get("reconnect_token")
+        if isinstance(token, str) and token:
+            return token
+    return None
+
+
 def _append_session_event(session_id: str, event_data: dict[str, Any]) -> dict[str, Any]:
     safe_session_id = str(session_id or "").strip()
     if not safe_session_id:
@@ -342,6 +551,71 @@ def _list_session_events(session_id: str, after: int = 0, limit: int = 200) -> l
             (session_id, max(0, after), max(1, min(limit, 1000))),
         ).fetchall()
     return [_row_to_session_event(row) for row in rows]
+
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _websocket_accept_key(key: str) -> str:
+    digest = hashlib.sha1((key + _WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _read_ws_text(rfile: Any, wfile: Any | None = None) -> str | None:
+    while True:
+        header = rfile.read(2)
+        if len(header) < 2:
+            return None
+        first, second = header
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", rfile.read(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", rfile.read(8))[0]
+        mask = rfile.read(4) if masked else b""
+        payload = rfile.read(length) if length else b""
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        if opcode == 0x8:
+            return None
+        if opcode == 0x9:
+            if wfile is not None:
+                _write_ws_pong(wfile, payload)
+            continue
+        if opcode == 0xA:
+            continue
+        if opcode != 0x1:
+            return ""
+        return payload.decode("utf-8")
+
+
+def _write_ws_text(wfile: Any, text: str) -> None:
+    payload = text.encode("utf-8")
+    header = bytearray([0x81])
+    if len(payload) < 126:
+        header.append(len(payload))
+    elif len(payload) < 65536:
+        header.append(126)
+        header.extend(struct.pack("!H", len(payload)))
+    else:
+        header.append(127)
+        header.extend(struct.pack("!Q", len(payload)))
+    wfile.write(bytes(header) + payload)
+    wfile.flush()
+
+
+def _write_ws_pong(wfile: Any, payload: bytes = b"") -> None:
+    if len(payload) >= 126:
+        payload = payload[:125]
+    wfile.write(bytes([0x8A, len(payload)]) + payload)
+    wfile.flush()
+
+
+def _write_ws_close(wfile: Any) -> None:
+    wfile.write(b"\x88\x00")
+    wfile.flush()
 
 
 def _create_drive_object(payload: dict[str, Any]) -> dict[str, Any]:
@@ -800,6 +1074,7 @@ def _graphql_response(body: dict[str, Any]) -> dict[str, Any]:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "hermes-warp-gateway/0.1"
+    protocol_version = "HTTP/1.1"
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -822,8 +1097,166 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         return json.loads(raw.decode("utf-8"))
 
+    def _is_websocket_request(self) -> bool:
+        return self.headers.get("upgrade", "").lower() == "websocket"
+
+    def _send_websocket_handshake(self) -> bool:
+        key = self.headers.get("sec-websocket-key")
+        if not key:
+            self._send_json(400, {"error": "missing sec-websocket-key"})
+            return False
+        self.send_response(101, "Switching Protocols")
+        self.send_header("upgrade", "websocket")
+        self.send_header("connection", "Upgrade")
+        self.send_header("sec-websocket-accept", _websocket_accept_key(key))
+        self.end_headers()
+        return True
+
+    def _handle_session_websocket(self, parsed: Any) -> None:
+        parts = parsed.path.strip("/").split("/")
+        if parts == ["sessions", "create"]:
+            mode = "create"
+            session_id = None
+        elif len(parts) == 3 and parts[0] == "sessions" and parts[2] == "resume":
+            mode = "resume"
+            session_id = parts[1]
+        elif len(parts) == 3 and parts[0] == "sessions" and parts[1] == "join":
+            mode = "join"
+            session_id = parts[2]
+        else:
+            self._send_json(404, {"error": "unknown session relay websocket route"})
+            return
+
+        if not self._send_websocket_handshake():
+            return
+        self.close_connection = True
+
+        first_message = _read_ws_text(self.rfile, self.wfile)
+        if first_message is None:
+            return
+
+        if mode == "create":
+            if not _is_initialize_message(first_message):
+                _write_ws_text(self.wfile, _failed_to_initialize_message("first message must be Initialize"))
+                _write_ws_close(self.wfile)
+                return
+            relay = _create_session_relay()
+            active_session_id = relay["sessionId"]
+            _append_session_event(
+                active_session_id,
+                {
+                    "kind": "relay.sharer.initialize",
+                    "payload": _relay_message_summary(first_message),
+                },
+            )
+            _write_ws_text(
+                self.wfile,
+                json.dumps(
+                    {
+                        "SessionInitialized": {
+                            "session_id": relay["sessionId"],
+                            "session_secret": relay["sessionSecret"],
+                            "reconnect_token": relay["reconnectToken"],
+                            "sharer_id": relay["sharerId"],
+                            "sharer_firebase_uid": relay["sharerFirebaseUid"],
+                        }
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        elif mode == "resume" and session_id is not None:
+            active_session_id = session_id
+            relay = _get_session_relay_private(session_id)
+            reconnect_token = _extract_reconnect_token(first_message)
+            if relay is None:
+                _write_ws_text(self.wfile, _failed_to_reconnect_message("SessionNotFound"))
+                _write_ws_close(self.wfile)
+                return
+            if reconnect_token != relay["reconnect_token"]:
+                _write_ws_text(self.wfile, _failed_to_reconnect_message("WrongReconnectionToken"))
+                _write_ws_close(self.wfile)
+                return
+            _append_session_event(
+                active_session_id,
+                {
+                    "kind": "relay.sharer.reconnect",
+                    "payload": _relay_message_summary(first_message),
+                },
+            )
+            _write_ws_text(
+                self.wfile,
+                json.dumps(
+                    {
+                        "SessionReconnected": {
+                            "last_received_event_no": relay["last_event_no"],
+                            "participant_list": _relay_participant_list(relay),
+                        }
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        elif mode == "join" and session_id is not None:
+            active_session_id = session_id
+            relay = _get_session_relay(session_id)
+            _append_session_event(
+                active_session_id,
+                {
+                    "kind": "relay.viewer.join.attempted",
+                    "payload": _relay_message_summary(first_message),
+                },
+            )
+            reason = "Invalid" if relay else "SessionNotFound"
+            _write_ws_text(
+                self.wfile,
+                json.dumps({"FailedToJoin": {"reason": reason}}, separators=(",", ":")),
+            )
+            _write_ws_close(self.wfile)
+            return
+        else:  # pragma: no cover - defensive branch
+            return
+
+        while True:
+            message = _read_ws_text(self.rfile, self.wfile)
+            if message is None:
+                break
+            summary = _relay_message_summary(message)
+            event_no = _extract_ordered_event_no(message)
+            variant = summary.get("variant")
+            if variant == "OrderedTerminalEvent" and event_no is None:
+                continue
+            _append_session_event(
+                active_session_id,
+                {"kind": "relay.sharer.upstream", "payload": summary},
+            )
+            _update_relay_last_event(active_session_id, event_no)
+            if variant == "Ping":
+                try:
+                    data = json.loads(message).get("Ping", {}).get("data", [])
+                except json.JSONDecodeError:
+                    data = []
+                _write_ws_text(self.wfile, json.dumps({"Pong": {"data": data}}, separators=(",", ":")))
+            elif variant == "OrderedTerminalEvent" and event_no is not None:
+                _write_ws_text(
+                    self.wfile,
+                    json.dumps(
+                        {"EventsProcessedAck": {"latest_processed_event_no": event_no}},
+                        separators=(",", ":"),
+                    ),
+                )
+            elif variant == "EndSession":
+                _append_session_event(
+                    active_session_id,
+                    {"kind": "relay.sharer.end", "payload": summary},
+                )
+                _delete_session_relay(active_session_id)
+                _write_ws_close(self.wfile)
+                break
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
+        if self._is_websocket_request() and parsed.path.startswith("/sessions/"):
+            self._handle_session_websocket(parsed)
+            return
         if parsed.path in {"/", "/healthz", "/readyz"}:
             self._send_json(
                 200,
@@ -872,7 +1305,7 @@ class Handler(BaseHTTPRequestHandler):
                 session_id = parts[2]
                 if len(parts) == 4 and parts[3] == "events":
                     params = parse_qs(parsed.query)
-                    after = int(params.get("after", ["0"])[0] or "0")
+                    after = _event_after(params.get("after", [None])[0])
                     limit = _event_limit(params.get("limit", [None])[0])
                     self._send_json(
                         200,
@@ -884,7 +1317,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if len(parts) == 5 and parts[3] == "events" and parts[4] == "stream":
                     params = parse_qs(parsed.query)
-                    after = int(params.get("after", ["0"])[0] or "0")
+                    after = _event_after(params.get("after", [None])[0])
                     limit = _event_limit(params.get("limit", [None])[0])
                     events = _list_session_events(session_id, after=after, limit=limit)
                     encoded = "".join(
@@ -909,6 +1342,7 @@ class Handler(BaseHTTPRequestHandler):
                             "sessionId": session_id,
                             "tasks": _list_session_tasks(session_id),
                             "events": _list_session_events(session_id, limit=20),
+                            "relay": _get_session_relay(session_id),
                         },
                     )
                     return
