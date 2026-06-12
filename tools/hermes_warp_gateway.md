@@ -18,11 +18,15 @@ Current surface:
   - `GET /hermes/drive/objects/<id>`
   - `POST /hermes/drive/objects`
   - `PUT /hermes/drive/objects/<id>`
-- First self-host session-sharing registry seam:
+- Self-host session-sharing registry + event journal v0:
   - `updateAgentTask` persists task/session/conversation bindings in SQLite
+  - `updateAgentTask` also appends an `agent.task.updated` session event when a session id is present
   - `GET /hermes/agent-tasks` lists reported task bindings
   - `GET /hermes/agent-tasks/<task_id>` reads a task binding
-  - `GET /hermes/sessions/<session_id>` lists tasks attached to a session id
+  - `GET /hermes/sessions/<session_id>` lists tasks and recent events attached to a session id
+  - `GET /hermes/sessions/<session_id>/events` lists ordered session events
+  - `POST /hermes/sessions/<session_id>/events` appends terminal/agent events
+  - `GET /hermes/sessions/<session_id>/events/stream?once=1` emits the event backlog as SSE
   - `GET /session/<session_id>` renders a small public-safe local handoff page
 
 Unknown GraphQL operations return an explicit error. The gateway should not fabricate Warp cloud state.
@@ -98,10 +102,10 @@ Run the repo-local verification script:
 script/verify-hermes-native
 ```
 
-It formats the repo, checks the Rust app, starts the gateway on an isolated smoke-test port with a temporary SQLite database, verifies model/harness GraphQL responses, verifies REST Drive object create/read/update/list, verifies GraphQL workflow and generic prompt-like object create/read/update/list, verifies `updateAgentTask` task/session binding plus `/hermes/sessions/<id>` and `/session/<id>`, and runs `git diff --check`.
+It formats the repo, checks the Rust app, starts the gateway on an isolated smoke-test port with a temporary SQLite database, verifies model/harness GraphQL responses, verifies REST Drive object create/read/update/list, verifies GraphQL workflow and generic prompt-like object create/read/update/list, verifies `updateAgentTask` task/session binding, verifies session event journal append/list/SSE backlog behavior, verifies `/hermes/sessions/<id>` and `/session/<id>`, and runs `git diff --check`.
 
 ## Next seams
 
 - Replace the prototype GraphQL string router with typed resolvers backed by Hermes config/provider state.
 - Patch the client cloud-object paths to use the Drive object compatibility layer.
-- Replace the first-pass session registry with the full self-hosted session relay on the `WARP_SESSION_SHARING_SERVER_URL` seam.
+- Bridge the session event journal v0 into a protocol-compatible `/sessions/create`, `/sessions/join/<id>`, and `/sessions/<id>/resume` relay on the `WARP_SESSION_SHARING_SERVER_URL` seam.

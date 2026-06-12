@@ -35,11 +35,11 @@ Joe wants a Warp Terminal fork that keeps the useful terminal/workspace/Drive/se
 8. Hermes/Migi is available as a first-class local harness option, including the `migi` alias.
 9. The gateway has a repo-local launch script, env example, user systemd unit, and operator docs.
 10. The docs cache under `~/.hermes/knowledge/warp-hermes-native/` records the Warp cloud/session/Drive docs used as source material.
-11. The gateway now has a first self-host session-sharing registry seam: `updateAgentTask` can persist a task/session/conversation binding locally, the binding is inspectable through `/hermes/agent-tasks/<task_id>` and `/hermes/sessions/<session_id>`, and `/session/<session_id>` gives a local/Tailscale handoff page instead of a Warp-hosted share surface.
+11. The gateway now has a self-host session-sharing registry plus event journal v0: `updateAgentTask` can persist a task/session/conversation binding locally, append an `agent.task.updated` event, expose session events through JSON/SSE endpoints, and `/session/<session_id>` gives a local/Tailscale handoff page instead of a Warp-hosted share surface.
 
 ## Later milestones
 - Replace the prototype `hermes-warp-gateway` with a typed service and GraphQL-compatible resolvers for login-free local workspace state, Drive object sync, harness catalog, and model list.
 - Replace Warp account/team assumptions with local workspace ACLs using Tailscale identity and/or Hermes profile identity.
 - Expand Drive compatibility beyond first-pass workflow/generic prompt-like objects into notebooks, env vars, folders, permissions, and deletion/conflict semantics.
-- Wire session sharing to Herdr panes/Migi session IDs and expose join/watch/steer links on the Tailscale dashboard.
+- Bridge the session event journal into a full protocol-compatible live terminal relay, wire it to Herdr panes/Migi session IDs, and expose join/watch/steer links on the Tailscale dashboard.
 - Add migration/import for existing Warp Drive objects from local SQLite and/or exported files.

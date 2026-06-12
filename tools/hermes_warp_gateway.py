@@ -95,6 +95,22 @@ def _connect() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_session_id_event_id "
+        "ON session_events(session_id, event_id)"
+    )
     return conn
 
 
@@ -125,6 +141,17 @@ def _row_to_agent_task(row: sqlite3.Row) -> dict[str, Any]:
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
         "rawInput": json.loads(row["raw_input"]),
+    }
+
+
+def _row_to_session_event(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "eventId": row["event_id"],
+        "sessionId": row["session_id"],
+        "taskId": row["task_id"],
+        "kind": row["kind"],
+        "payload": json.loads(row["payload"]),
+        "createdAt": row["created_at"],
     }
 
 
@@ -225,6 +252,22 @@ def _upsert_agent_task(input_data: dict[str, Any]) -> dict[str, Any]:
             )
     found = _get_agent_task(task_id)
     assert found is not None
+    if found.get("sessionId"):
+        _append_session_event(
+            found["sessionId"],
+            {
+                "kind": "agent.task.updated",
+                "taskId": found["taskId"],
+                "payload": {
+                    "taskId": found["taskId"],
+                    "sessionId": found["sessionId"],
+                    "conversationId": found["conversationId"],
+                    "taskState": found["taskState"],
+                    "statusMessage": found["statusMessage"],
+                    "errorCode": found["errorCode"],
+                },
+            },
+        )
     return found
 
 
@@ -247,6 +290,58 @@ def _list_session_tasks(session_id: str) -> list[dict[str, Any]]:
             (session_id,),
         ).fetchall()
     return [_row_to_agent_task(row) for row in rows]
+
+
+def _event_limit(value: str | None) -> int:
+    try:
+        limit = int(value or "200")
+    except ValueError:
+        limit = 200
+    return max(1, min(limit, 1000))
+
+
+def _append_session_event(session_id: str, event_data: dict[str, Any]) -> dict[str, Any]:
+    safe_session_id = str(session_id or "").strip()
+    if not safe_session_id:
+        raise ValueError("session event missing session id")
+    kind = str(event_data.get("kind") or "session.event").strip() or "session.event"
+    task_id = event_data.get("taskId") or event_data.get("task_id")
+    payload = event_data.get("payload", event_data)
+    timestamp = _now()
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO session_events (session_id, task_id, kind, payload, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                safe_session_id,
+                str(task_id) if task_id is not None else None,
+                kind,
+                json.dumps(payload, sort_keys=True),
+                timestamp,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM session_events WHERE event_id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+    assert row is not None
+    return _row_to_session_event(row)
+
+
+def _list_session_events(session_id: str, after: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM session_events
+            WHERE session_id = ? AND event_id > ?
+            ORDER BY event_id ASC
+            LIMIT ?
+            """,
+            (session_id, max(0, after), max(1, min(limit, 1000))),
+        ).fetchall()
+    return [_row_to_session_event(row) for row in rows]
 
 
 def _create_drive_object(payload: dict[str, Any]) -> dict[str, Any]:
@@ -772,23 +867,72 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path.startswith("/hermes/sessions/"):
-            session_id = parsed.path.rsplit("/", 1)[-1]
-            self._send_json(200, {"sessionId": session_id, "tasks": _list_session_tasks(session_id)})
-            return
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) >= 3 and parts[0] == "hermes" and parts[1] == "sessions":
+                session_id = parts[2]
+                if len(parts) == 4 and parts[3] == "events":
+                    params = parse_qs(parsed.query)
+                    after = int(params.get("after", ["0"])[0] or "0")
+                    limit = _event_limit(params.get("limit", [None])[0])
+                    self._send_json(
+                        200,
+                        {
+                            "sessionId": session_id,
+                            "events": _list_session_events(session_id, after=after, limit=limit),
+                        },
+                    )
+                    return
+                if len(parts) == 5 and parts[3] == "events" and parts[4] == "stream":
+                    params = parse_qs(parsed.query)
+                    after = int(params.get("after", ["0"])[0] or "0")
+                    limit = _event_limit(params.get("limit", [None])[0])
+                    events = _list_session_events(session_id, after=after, limit=limit)
+                    encoded = "".join(
+                        "id: {event_id}\nevent: {kind}\ndata: {data}\n\n".format(
+                            event_id=event["eventId"],
+                            kind=event["kind"],
+                            data=json.dumps(event, separators=(",", ":")),
+                        )
+                        for event in events
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream; charset=utf-8")
+                    self.send_header("cache-control", "no-cache")
+                    self.send_header("content-length", str(len(encoded)))
+                    self.end_headers()
+                    self.wfile.write(encoded)
+                    return
+                if len(parts) == 3:
+                    self._send_json(
+                        200,
+                        {
+                            "sessionId": session_id,
+                            "tasks": _list_session_tasks(session_id),
+                            "events": _list_session_events(session_id, limit=20),
+                        },
+                    )
+                    return
 
         if parsed.path.startswith("/session/"):
             session_id = parsed.path.rsplit("/", 1)[-1]
             tasks = _list_session_tasks(session_id)
+            events = _list_session_events(session_id, limit=10)
             task_items = "".join(
                 f"<li><code>{html.escape(task['taskId'])}</code> — "
                 f"{html.escape(str(task.get('taskState') or 'state unknown'))}</li>"
                 for task in tasks
             ) or "<li>No agent tasks have reported this session id yet.</li>"
+            event_items = "".join(
+                f"<li><code>#{event['eventId']}</code> "
+                f"{html.escape(event['kind'])} — "
+                f"{html.escape(str(event.get('taskId') or 'session'))}</li>"
+                for event in events
+            ) or "<li>No session events have been written yet.</li>"
             safe_session_id = html.escape(session_id)
             self._send_html(
                 200,
                 f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes Warp Session {safe_session_id}</title><style>body{{margin:0;background:#030405;color:#e8ecec;font-family:system-ui,sans-serif;padding:32px}}main{{max-width:880px;margin:auto;border:1px solid #343b3d;border-radius:24px;background:#0b0f10;padding:28px;box-shadow:0 24px 80px #000}}.k{{color:#c89b45;text-transform:uppercase;letter-spacing:.16em;font-weight:900;font-size:12px}}h1{{font-size:clamp(32px,6vw,64px);line-height:.9;margin:.25em 0}}code{{color:#d8b16c}}li{{margin:.6em 0}}a{{color:#d8b16c}}</style></head><body><main><div class="k">Hermes-native Warp · self-host session registry</div><h1>Session {safe_session_id}</h1><p>This is the local/Tailscale handoff surface for a Warp shared session. Full terminal relay is a later seam; this registry proves the client can bind agent tasks to a self-hosted session id without Warp cloud.</p><h2>Linked tasks</h2><ul>{task_items}</ul><p>Machine-readable state: <a href="/hermes/sessions/{safe_session_id}">/hermes/sessions/{safe_session_id}</a></p></main></body></html>""",
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes Warp Session {safe_session_id}</title><style>body{{margin:0;background:#030405;color:#e8ecec;font-family:system-ui,sans-serif;padding:32px}}main{{max-width:920px;margin:auto;border:1px solid #343b3d;border-radius:24px;background:#0b0f10;padding:28px;box-shadow:0 24px 80px #000}}.k{{color:#c89b45;text-transform:uppercase;letter-spacing:.16em;font-weight:900;font-size:12px}}h1{{font-size:clamp(32px,6vw,64px);line-height:.9;margin:.25em 0}}code{{color:#d8b16c}}li{{margin:.6em 0}}a{{color:#d8b16c}}</style></head><body><main><div class="k">Hermes-native Warp · self-host session registry + event journal</div><h1>Session {safe_session_id}</h1><p>This is the local/Tailscale handoff surface for a Warp shared session. Full protocol-compatible terminal relay is a later seam; this page proves the client can bind agent tasks and append session events to Joe-controlled infrastructure without Warp cloud.</p><h2>Linked tasks</h2><ul>{task_items}</ul><h2>Recent events</h2><ul>{event_items}</ul><p>Machine-readable state: <a href="/hermes/sessions/{safe_session_id}">/hermes/sessions/{safe_session_id}</a> · <a href="/hermes/sessions/{safe_session_id}/events">/hermes/sessions/{safe_session_id}/events</a> · <a href="/hermes/sessions/{safe_session_id}/events/stream?once=1">SSE once</a></p></main></body></html>""",
             )
             return
 
@@ -804,6 +948,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, _graphql_response(body))
             return
+
+        if parsed.path.startswith("/hermes/sessions/") and parsed.path.endswith("/events"):
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) == 4 and parts[0] == "hermes" and parts[1] == "sessions" and parts[3] == "events":
+                try:
+                    event = _append_session_event(parts[2], self._read_json())
+                except Exception as exc:  # pragma: no cover - defensive gateway edge
+                    self._send_json(400, {"error": f"invalid session event: {exc}"})
+                    return
+                self._send_json(201, {"event": event})
+                return
 
         if parsed.path == "/hermes/drive/objects":
             try:

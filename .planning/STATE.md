@@ -13,3 +13,4 @@ Commit, push, upstream PR, deploy/restart, and destructive actions require Joe a
 | Date | Task | Summary |
 | --- | --- | --- |
 | 2026-06-10 | Session sharing registry seam | Verified `updateAgentTask` local task/session binding plus session inspection/handoff routes in `hermes-warp-gateway`; full relay remains next seam. |
+| 2026-06-11 | Session event journal v0 | Added self-hosted session event persistence/list/append/SSE backlog endpoints to `hermes-warp-gateway`, wired `updateAgentTask` into `agent.task.updated` events, and updated gateway/product docs; full protocol-compatible live relay remains next seam. |

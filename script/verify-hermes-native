@@ -114,6 +114,17 @@ with tempfile.TemporaryDirectory() as tmpdir:
             with urllib.request.urlopen(request, timeout=3) as response:
                 return json.load(response)
 
+        def request_text(method, path, payload=None):
+            data = None if payload is None else json.dumps(payload).encode()
+            request = urllib.request.Request(
+                f'http://127.0.0.1:{port}' + path,
+                data=data,
+                headers={'content-type': 'application/json'},
+                method=method,
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return response.read().decode()
+
         harness = graphql(
             'get_available_harnesses',
             'query { user { __typename ... on UserOutput { user { availableHarnesses { harnesses { harness displayName enabled availableModels { id displayName reasoningLevel } } } } } } }',
@@ -171,7 +182,18 @@ with tempfile.TemporaryDirectory() as tmpdir:
             {'input': {'taskId': 'task-smoke', 'sessionId': 'session-smoke', 'conversationId': 'conversation-smoke', 'taskState': 'IN_PROGRESS', 'statusMessage': {'message': 'sharing locally'}}},
         )
         task_lookup = request_json('GET', '/hermes/agent-tasks/task-smoke')['task']
+        event_created = request_json('POST', '/hermes/sessions/session-smoke/events', {
+            'kind': 'terminal.output',
+            'taskId': 'task-smoke',
+            'payload': {'text': 'hello from self-host event journal'},
+        })['event']
         session_lookup = request_json('GET', '/hermes/sessions/session-smoke')
+        session_events = request_json('GET', '/hermes/sessions/session-smoke/events')['events']
+        session_events_after = request_json(
+            'GET',
+            f"/hermes/sessions/session-smoke/events?after={event_created['eventId'] - 1}&limit=1",
+        )['events']
+        session_events_stream = request_text('GET', '/hermes/sessions/session-smoke/events/stream?once=1')
         session_page = urllib.request.urlopen(f'http://127.0.0.1:{port}/session/session-smoke', timeout=3).read().decode()
 
         assert health['ok'] is True
@@ -195,8 +217,19 @@ with tempfile.TemporaryDirectory() as tmpdir:
         assert task_lookup['sessionId'] == 'session-smoke'
         assert task_lookup['conversationId'] == 'conversation-smoke'
         assert any(task['taskId'] == 'task-smoke' for task in session_lookup['tasks'])
+        assert any(event['kind'] == 'agent.task.updated' for event in session_lookup['events'])
+        assert any(event['kind'] == 'terminal.output' for event in session_events)
+        assert event_created['payload']['text'] == 'hello from self-host event journal'
+        assert [event['eventId'] for event in session_events] == sorted(event['eventId'] for event in session_events)
+        assert session_events_after[0]['eventId'] == event_created['eventId']
+        assert 'event: agent.task.updated' in session_events_stream
+        assert 'event: terminal.output' in session_events_stream
+        assert 'data:' in session_events_stream
         assert 'Session session-smoke' in session_page
+        assert 'Recent events' in session_page
+        assert '/hermes/sessions/session-smoke/events' in session_page
         assert 'sessions.app.warp.dev' not in session_page
+        assert 'sessions.app.warp.dev' not in json.dumps(session_events).lower()
         print('gateway smoke ok')
     finally:
         proc.terminate()

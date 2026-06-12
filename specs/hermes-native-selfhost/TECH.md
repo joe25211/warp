@@ -89,10 +89,13 @@ The gateway must eventually provide:
   - `getCloudObject` / `getUpdatedCloudObjects`
 - `POST /graphql/v2` session-sharing registry response:
   - `updateAgentTask` stores `taskId`, `sessionId`, `conversationId`, state, and status locally
-- REST session registry inspection:
+- REST session registry and event-journal inspection:
   - `GET /hermes/agent-tasks`
   - `GET /hermes/agent-tasks/<task_id>`
   - `GET /hermes/sessions/<session_id>`
+  - `GET /hermes/sessions/<session_id>/events`
+  - `POST /hermes/sessions/<session_id>/events`
+  - `GET /hermes/sessions/<session_id>/events/stream?once=1` for SSE backlog reads
   - `GET /session/<session_id>` for a minimal local/Tailscale handoff page
 - REST Drive seam:
   - `GET /hermes/drive/objects`
@@ -140,13 +143,13 @@ Verify the slice end-to-end:
 script/verify-hermes-native
 ```
 
-This runs formatting, channel tests, `cargo check -p warp_core`, `cargo check -p warp`, gateway smoke checks for model/harness GraphQL responses, REST Drive object create/read/update/list, GraphQL workflow and generic prompt-like object create/read/update/list, and `git diff --check`.
+This runs formatting, channel tests, `cargo check -p warp_core`, `cargo check -p warp`, gateway smoke checks for model/harness GraphQL responses, REST Drive object create/read/update/list, GraphQL workflow and generic prompt-like object create/read/update/list, `updateAgentTask` task/session binding, session event journal append/list/SSE backlog behavior, and `git diff --check`.
 
 ## Hermes harness polish
 `crates/warp_cli/src/agent.rs` now has a first-class `Harness::Hermes` selectable as `hermes` or `migi`. The app maps it through CLI-agent selection, display, setup readiness, local child task config, ambient-agent selection, and auth-secret bypass paths. Hermes is intentionally local-first and does not request Warp-managed harness secrets.
 
 ## Next implementation slices
 1. Replace the prototype gateway with a typed service and real GraphQL schema/resolvers backed by Hermes config/provider state.
-2. Patch session sharing to use the self-hosted relay and bind sessions to Herdr/Hermes session IDs.
+2. Bridge the session event journal v0 into the protocol-compatible self-hosted relay and bind sessions to Herdr/Hermes session IDs.
 3. Expand Drive compatibility beyond workflow and generic prompt-like objects into notebooks, env vars, folders, permissions, and deletion/conflict semantics.
 4. Add integration tests proving Hermes-native mode does not contact `*.warp.dev` for harness/model/session sharing paths.
