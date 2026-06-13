@@ -515,6 +515,20 @@ with tempfile.TemporaryDirectory() as tmpdir:
             proc.wait(timeout=3)
 PY
 
+printf '%s\n' '== operator artifacts =='
+python - <<'PY'
+from pathlib import Path
+service = Path('tools/hermes-warp-gateway.service').read_text()
+env_example = Path('tools/hermes_warp_gateway.env.example').read_text()
+assert '/home/joe' not in service
+assert '/home/joe' not in env_example
+assert 'ExecStart=/usr/bin/env python3 %h/Projects/warp-hermes-native' not in service
+assert 'WorkingDirectory=%h/Projects/warp-hermes-native' not in service
+assert 'HERMES_WARP_GATEWAY_REPO' in service
+assert 'HERMES_WARP_GATEWAY_REPO' in env_example
+print('operator artifacts ok')
+PY
+
 printf '%s\n' '== diff hygiene =='
 git diff --check
 

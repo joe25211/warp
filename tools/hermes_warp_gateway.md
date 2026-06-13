@@ -71,7 +71,7 @@ python3 tools/hermes_warp_gateway.py --print-env
 
 ## User systemd unit
 
-Install the unit for the current user:
+Install the unit for the current user. If your checkout is not at `~/Projects/warp-hermes-native`, set `HERMES_WARP_GATEWAY_REPO` in `~/.config/hermes-warp-gateway/env` before starting the service:
 
 ```bash
 mkdir -p ~/.config/systemd/user ~/.config/hermes-warp-gateway
