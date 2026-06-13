@@ -2911,7 +2911,10 @@ impl From<warp_graphql::workspace::DisableReason> for DisableReason {
 fn graphql_url_is_self_hosted(url: &str) -> bool {
     Url::parse(url)
         .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        })
         .is_some_and(|host| host != "warp.dev" && !host.ends_with(".warp.dev"))
 }
 

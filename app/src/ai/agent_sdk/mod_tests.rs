@@ -53,21 +53,31 @@ fn run_agent_command_for_harness(harness: Harness) -> CliCommand {
     }))
 }
 
+struct HermesNativeEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl Drop for HermesNativeEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => unsafe { std::env::set_var(Channel::HERMES_NATIVE_MODE_ENV, value) },
+            None => unsafe { std::env::remove_var(Channel::HERMES_NATIVE_MODE_ENV) },
+        }
+        ChannelState::set(ChannelState::init());
+    }
+}
+
 fn with_hermes_native_env<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
-    let previous = std::env::var_os(Channel::HERMES_NATIVE_MODE_ENV);
+    let _guard = HermesNativeEnvGuard {
+        previous: std::env::var_os(Channel::HERMES_NATIVE_MODE_ENV),
+    };
     if enabled {
         unsafe { std::env::set_var(Channel::HERMES_NATIVE_MODE_ENV, "1") };
     } else {
         unsafe { std::env::remove_var(Channel::HERMES_NATIVE_MODE_ENV) };
     }
     ChannelState::set(ChannelState::init());
-    let result = run();
-    match previous {
-        Some(value) => unsafe { std::env::set_var(Channel::HERMES_NATIVE_MODE_ENV, value) },
-        None => unsafe { std::env::remove_var(Channel::HERMES_NATIVE_MODE_ENV) },
-    }
-    ChannelState::set(ChannelState::init());
-    result
+    run()
 }
 
 #[test]

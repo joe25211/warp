@@ -19,6 +19,10 @@ fn hermes_native_graphql_endpoint_guard_rejects_warp_hosts() {
     assert!(!graphql_url_is_self_hosted(
         "https://app.warp.dev/graphql/v2"
     ));
+    assert!(!graphql_url_is_self_hosted("https://warp.dev./graphql/v2"));
+    assert!(!graphql_url_is_self_hosted(
+        "https://staging.warp.dev./graphql/v2"
+    ));
     assert!(!graphql_url_is_self_hosted(
         "https://staging.warp.dev/graphql/v2"
     ));

@@ -31,7 +31,10 @@ fn hermes_native_selfhost_graphql_mode() -> bool {
         && ChannelState::channel().allows_server_url_overrides()
         && Url::parse(ChannelState::server_root_url().as_ref())
             .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+            })
             .is_some_and(|host| host != "warp.dev" && !host.ends_with(".warp.dev"))
 }
 
