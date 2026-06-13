@@ -625,18 +625,22 @@ pub fn run() -> Result<()> {
     {
         let session_url = ChannelState::session_sharing_server_url()
             .ok_or_else(|| anyhow!("WARP_HERMES_NATIVE requires WARP_SESSION_SHARING_SERVER_URL to point at a self-host relay"))?;
-        let session_url = Url::parse(session_url.as_ref()).map_err(|e| {
-            anyhow!("Invalid WARP_SESSION_SHARING_SERVER_URL for Hermes-native mode: {e:#}")
-        })?;
-        let host = session_url
-            .host_str()
-            .map(|host| host.to_ascii_lowercase())
-            .ok_or_else(|| anyhow!("WARP_SESSION_SHARING_SERVER_URL must include a host"))?;
-        if host == "warp.dev" || host.ends_with(".warp.dev") {
-            return Err(anyhow!(
-                "WARP_HERMES_NATIVE requires a self-host WARP_SESSION_SHARING_SERVER_URL; refusing Warp-hosted session relay {host}"
-            ));
-        }
+        let require_self_host = |label: &str, value: &str| -> anyhow::Result<()> {
+            let parsed = Url::parse(value)
+                .map_err(|e| anyhow!("Invalid {label} for Hermes-native mode: {e:#}"))?;
+            let host = parsed
+                .host_str()
+                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+                .ok_or_else(|| anyhow!("{label} must include a host"))?;
+            if host == "warp.dev" || host.ends_with(".warp.dev") {
+                return Err(anyhow!(
+                    "WARP_HERMES_NATIVE requires a self-host {label}; refusing Warp-hosted endpoint {host}"
+                ));
+            }
+            Ok(())
+        };
+        require_self_host("WARP_SESSION_SHARING_SERVER_URL", session_url.as_ref())?;
+        require_self_host("WARP_WS_SERVER_URL", ChannelState::ws_server_url().as_ref())?;
     }
 
     if let Some(command) = args.command() {

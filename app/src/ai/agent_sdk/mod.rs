@@ -13,6 +13,7 @@ pub(crate) use driver::harness::{task_env_vars, validate_cli_installed, ClaudeHa
 pub use driver::AgentDriver;
 use driver::AgentDriverError;
 use telemetry::CliTelemetryEvent;
+use url::Url;
 use warp_cli::agent::{
     AgentCommand, AgentProfileCommand, Harness, OutputFormat, Prompt, RunAgentArgs,
 };
@@ -29,7 +30,7 @@ use warp_cli::schedule::ScheduleSubcommand;
 use warp_cli::secret::SecretCommand;
 use warp_cli::share::ShareRequest;
 use warp_cli::task::{MessageCommand, TaskCommand};
-use warp_cli::{CliCommand, GlobalOptions, OZ_HARNESS_ENV};
+use warp_cli::{CliCommand, GlobalOptions, OZ_HARNESS_ENV, SERVER_ROOT_URL_OVERRIDE_ENV};
 use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_graphql::object_permissions::OwnerType;
@@ -583,10 +584,26 @@ fn run_task(
     }
 }
 
+fn url_has_self_hosted_host(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        })
+        .is_some_and(|host| host != "warp.dev" && !host.ends_with(".warp.dev"))
+}
+
+fn hermes_native_server_root_url() -> String {
+    std::env::var(SERVER_ROOT_URL_OVERRIDE_ENV)
+        .unwrap_or_else(|_| ChannelState::server_root_url().into_owned())
+}
+
 fn hermes_native_selfhost_agent_run(harness: Harness) -> bool {
     harness == Harness::Hermes
         && Channel::hermes_native_mode_enabled()
         && ChannelState::channel().allows_server_url_overrides()
+        && url_has_self_hosted_host(&hermes_native_server_root_url())
 }
 
 /// Singleton model that provides a ModelContext for spawning async operations
