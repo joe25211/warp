@@ -4,6 +4,7 @@ use std::time::Duration;
 use instant::Instant;
 use serde::{Deserialize, Serialize};
 use warp_cli::agent::Harness;
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_core::user_preferences::GetUserPreferences;
 use warp_managed_secrets::client::SecretOwner;
@@ -42,9 +43,21 @@ pub struct HarnessAvailability {
 }
 
 /// Default fallback used before the server responds.
-/// Oz is enabled by default so the UI is usable pre-fetch; the server
-/// list (which respects admin overrides) replaces this once available.
+///
+/// In normal Warp builds, Oz is enabled by default so the UI is usable pre-fetch; the server list
+/// (which respects admin overrides) replaces this once available. In Hermes-native self-host mode,
+/// never seed the UI with Warp-hosted Oz/cloud models. The self-hosted Hermes compatibility server
+/// must provide the harness list, or the UI should show no built-in cloud agent surface rather than
+/// silently falling back to Warp-hosted infrastructure.
+fn hermes_native_harness_mode_enabled() -> bool {
+    Channel::hermes_native_mode_enabled() && ChannelState::channel().allows_server_url_overrides()
+}
+
 fn default_harnesses() -> Vec<HarnessAvailability> {
+    if hermes_native_harness_mode_enabled() {
+        return vec![];
+    }
+
     vec![HarnessAvailability {
         harness: Harness::Oz,
         display_name: "Warp".to_string(),
@@ -103,7 +116,11 @@ pub struct HarnessAvailabilityModel {
 
 impl HarnessAvailabilityModel {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let harnesses = get_cached(ctx).unwrap_or_else(default_harnesses);
+        let harnesses = if hermes_native_harness_mode_enabled() {
+            default_harnesses()
+        } else {
+            get_cached(ctx).unwrap_or_else(default_harnesses)
+        };
 
         ctx.subscribe_to_model(&NetworkStatus::handle(ctx), |me, event, ctx| {
             if let NetworkStatusEvent::NetworkStatusChanged {
@@ -339,8 +356,17 @@ impl HarnessAvailabilityModel {
     }
 
     pub fn refresh(&self, ctx: &mut ModelContext<Self>) {
-        // The endpoint queries `user`, which requires auth.
-        if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
+        let server_root_url = ChannelState::server_root_url();
+        if Channel::hermes_native_mode_enabled() && server_root_url.contains("warp.dev") {
+            return;
+        }
+
+        // Normal Warp cloud `user` queries require auth. In Hermes-native self-host mode the
+        // compatibility gateway serves the same shape locally so the harness picker can populate
+        // before any Warp login exists.
+        if !hermes_native_harness_mode_enabled()
+            && !AuthStateProvider::as_ref(ctx).get().is_logged_in()
+        {
             return;
         }
 
@@ -351,7 +377,9 @@ impl HarnessAvailabilityModel {
                 Ok(new_harnesses) => {
                     if new_harnesses != me.harnesses {
                         me.harnesses = new_harnesses;
-                        me.cache(ctx);
+                        if !hermes_native_harness_mode_enabled() {
+                            me.cache(ctx);
+                        }
                         // Invalidate cached auth secrets so the next menu open refetches.
                         let stale: Vec<Harness> = me.auth_secrets.keys().copied().collect();
                         for harness in stale {
@@ -409,7 +437,9 @@ fn harness_to_graphql_harness(harness: Harness) -> Option<warp_graphql::ai::Agen
         Harness::Claude => Some(warp_graphql::ai::AgentHarness::ClaudeCode),
         Harness::Gemini => Some(warp_graphql::ai::AgentHarness::Gemini),
         Harness::Codex => Some(warp_graphql::ai::AgentHarness::Codex),
-        Harness::OpenCode | Harness::Unknown => None,
+        // Hermes/Migi is local-first in the self-host fork. It does not use Warp-managed
+        // harness auth secrets, so do not ask the cloud GraphQL API for secret metadata.
+        Harness::Hermes | Harness::OpenCode | Harness::Unknown => None,
     }
 }
 

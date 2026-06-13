@@ -651,6 +651,7 @@ impl TerminalView {
             Harness::OpenCode => matches!(cli_agent, CLIAgent::OpenCode),
             Harness::Gemini => matches!(cli_agent, CLIAgent::Gemini),
             Harness::Codex => matches!(cli_agent, CLIAgent::Codex),
+            Harness::Hermes => matches!(cli_agent, CLIAgent::Hermes),
             Harness::Unknown => false,
         }
     }

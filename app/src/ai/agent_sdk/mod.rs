@@ -13,6 +13,7 @@ pub(crate) use driver::harness::{task_env_vars, validate_cli_installed, ClaudeHa
 pub use driver::AgentDriver;
 use driver::AgentDriverError;
 use telemetry::CliTelemetryEvent;
+use url::Url;
 use warp_cli::agent::{
     AgentCommand, AgentProfileCommand, Harness, OutputFormat, Prompt, RunAgentArgs,
 };
@@ -29,7 +30,8 @@ use warp_cli::schedule::ScheduleSubcommand;
 use warp_cli::secret::SecretCommand;
 use warp_cli::share::ShareRequest;
 use warp_cli::task::{MessageCommand, TaskCommand};
-use warp_cli::{CliCommand, GlobalOptions, OZ_HARNESS_ENV};
+use warp_cli::{CliCommand, GlobalOptions, OZ_HARNESS_ENV, SERVER_ROOT_URL_OVERRIDE_ENV};
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_graphql::object_permissions::OwnerType;
 use warp_isolation_platform::IsolationPlatformError;
@@ -582,6 +584,28 @@ fn run_task(
     }
 }
 
+fn url_has_self_hosted_host(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        })
+        .is_some_and(|host| host != "warp.dev" && !host.ends_with(".warp.dev"))
+}
+
+fn hermes_native_server_root_url() -> String {
+    std::env::var(SERVER_ROOT_URL_OVERRIDE_ENV)
+        .unwrap_or_else(|_| ChannelState::server_root_url().into_owned())
+}
+
+fn hermes_native_selfhost_agent_run(harness: Harness) -> bool {
+    harness == Harness::Hermes
+        && Channel::hermes_native_mode_enabled()
+        && ChannelState::channel().allows_server_url_overrides()
+        && url_has_self_hosted_host(&hermes_native_server_root_url())
+}
+
 /// Singleton model that provides a ModelContext for spawning async operations
 /// when starting the agent driver. This is needed because conversation fetching
 /// requires spawning an async task, which requires a ModelContext.
@@ -610,34 +634,43 @@ impl AgentDriverRunner {
             Some(task_id) => SetupClientEventReporter::new(task_id, server_api.clone(), background),
             None => SetupClientEventReporter::noop(server_api.clone(), background),
         };
+        let skip_cloud_prereqs = hermes_native_selfhost_agent_run(args.harness);
         setup_events
             .post_timeline_event(OzRunTimelineEvent::WorkerContainerReady)
             .await;
 
-        // Ensure we've synced team state before starting the driver.
-        setup_events
-            .record_result(
-                SetupStep::TeamMetadataRefresh,
-                Self::refresh_team_metadata(&foreground),
-            )
-            .await?;
+        // Ensure we've synced team state before starting the driver. Hermes-native self-host
+        // runs are intentionally local-first and can start while logged out, so avoid cloud
+        // metadata refreshes that require a Warp token in that path.
+        if !skip_cloud_prereqs {
+            setup_events
+                .record_result(
+                    SetupStep::TeamMetadataRefresh,
+                    Self::refresh_team_metadata(&foreground),
+                )
+                .await?;
+        }
 
         // Wait for Warp Drive to sync before building the task config, since
         // prompt resolution (SavedPrompt -> workflow lookup) and environment
-        // resolution (CloudAmbientAgentEnvironment lookup) depend on it.
-        setup_events
-            .record_result(SetupStep::WarpDriveSync, async {
-                if foreground
-                    .spawn(|_, ctx| common::refresh_warp_drive(ctx))
-                    .await?
-                    .await
-                    .is_err()
-                {
-                    return Err(AgentDriverError::WarpDriveSyncFailed);
-                }
-                Ok(())
-            })
-            .await?;
+        // resolution (CloudAmbientAgentEnvironment lookup) depend on it. Hermes-native
+        // self-host runs use local prompt/config paths and the local gateway, so they
+        // must not block on logged-in Warp Drive state.
+        if !skip_cloud_prereqs {
+            setup_events
+                .record_result(SetupStep::WarpDriveSync, async {
+                    if foreground
+                        .spawn(|_, ctx| common::refresh_warp_drive(ctx))
+                        .await?
+                        .await
+                        .is_err()
+                    {
+                        return Err(AgentDriverError::WarpDriveSyncFailed);
+                    }
+                    Ok(())
+                })
+                .await?;
+        }
 
         // Set up and run the driver, reporting any errors back to the server.
         let result: Result<(), AgentDriverError> = async {
@@ -1447,7 +1480,7 @@ impl AgentDriverRunner {
 fn command_requires_auth(command: &CliCommand) -> bool {
     match command {
         CliCommand::Agent(agent_cmd) => match agent_cmd {
-            AgentCommand::Run { .. } => true,
+            AgentCommand::Run(args) => !hermes_native_selfhost_agent_run(args.harness),
             AgentCommand::RunCloud { .. } => true,
             AgentCommand::Profile(sub) => match sub {
                 AgentProfileCommand::List => true,
@@ -1598,6 +1631,7 @@ fn resolve_orchestration_harness_label() -> &'static str {
         Some(Harness::OpenCode) => "opencode",
         Some(Harness::Gemini) => "gemini",
         Some(Harness::Codex) => "codex",
+        Some(Harness::Hermes) => "hermes",
         Some(Harness::Unknown) | None => "unknown",
     }
 }

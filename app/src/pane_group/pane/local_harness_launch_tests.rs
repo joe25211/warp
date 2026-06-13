@@ -8,8 +8,8 @@ use warp_core::features::FeatureFlag;
 
 use super::{
     build_local_claude_child_command, build_local_codex_child_command,
-    build_local_opencode_child_command, local_child_task_config, local_claude_child_prompt,
-    normalize_local_child_harness, prepare_local_harness_child_launch,
+    build_local_hermes_child_command, build_local_opencode_child_command, local_child_task_config,
+    local_claude_child_prompt, normalize_local_child_harness, prepare_local_harness_child_launch,
     validate_local_harness_shell,
 };
 use crate::ai::agent_sdk::driver::OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV;
@@ -109,6 +109,11 @@ fn normalize_local_child_harness_accepts_supported_aliases() {
         Some(Harness::OpenCode)
     );
     assert_eq!(normalize_local_child_harness("codex"), Some(Harness::Codex));
+    assert_eq!(
+        normalize_local_child_harness("hermes"),
+        Some(Harness::Hermes)
+    );
+    assert_eq!(normalize_local_child_harness("migi"), Some(Harness::Hermes));
 }
 
 #[test]
@@ -168,8 +173,29 @@ fn build_local_codex_child_command_quotes_the_prompt() {
 }
 
 #[test]
+fn build_local_hermes_child_command_quotes_the_prompt() {
+    assert_eq!(
+        build_local_hermes_child_command("hello world", None),
+        "hermes chat --quiet --query 'hello world'"
+    );
+}
+
+#[test]
+fn build_local_hermes_child_command_passes_selected_model() {
+    assert_eq!(
+        build_local_hermes_child_command("hello world", Some("hermes/migi-default")),
+        "hermes chat --quiet --model hermes/migi-default --query 'hello world'"
+    );
+}
+
+#[test]
 fn local_child_task_config_records_supported_third_party_harnesses() {
-    for harness in [Harness::Claude, Harness::OpenCode, Harness::Codex] {
+    for harness in [
+        Harness::Claude,
+        Harness::OpenCode,
+        Harness::Codex,
+        Harness::Hermes,
+    ] {
         assert_eq!(
             local_child_task_config(harness, None),
             Some(crate::ai::ambient_agents::task::AgentConfigSnapshot {
@@ -182,7 +208,12 @@ fn local_child_task_config_records_supported_third_party_harnesses() {
 
 #[test]
 fn local_child_task_config_stamps_orchestrator_name() {
-    for harness in [Harness::Claude, Harness::OpenCode, Harness::Codex] {
+    for harness in [
+        Harness::Claude,
+        Harness::OpenCode,
+        Harness::Codex,
+        Harness::Hermes,
+    ] {
         assert_eq!(
             local_child_task_config(harness, Some("frontend-tests".to_string())),
             Some(crate::ai::ambient_agents::task::AgentConfigSnapshot {
@@ -401,6 +432,43 @@ async fn prepare_local_claude_child_no_anthropic_model_when_empty() {
     assert!(!prepared
         .env_vars
         .contains_key(&OsString::from("ANTHROPIC_MODEL")));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn prepare_local_hermes_child_passes_selected_model_to_cli() {
+    let fake_home = TempDir::new().unwrap();
+    let fake_bin_dir = TempDir::new().unwrap();
+    let working_dir = fake_home.path().join("workspace");
+    fs::create_dir_all(&working_dir).unwrap();
+    write_fake_cli(fake_bin_dir.path(), "hermes");
+
+    let _home = EnvVarGuard::set("HOME", fake_home.path().as_os_str().to_os_string());
+    let _path = EnvVarGuard::set("PATH", fake_bin_dir.path().as_os_str().to_os_string());
+
+    let mut ai_client = MockAIClient::new();
+    ai_client
+        .expect_create_agent_task()
+        .times(1)
+        .returning(|_, _, _, _| Ok("550e8400-e29b-41d4-a716-446655440000".parse().unwrap()));
+
+    let prepared = prepare_local_harness_child_launch(
+        "hello world".to_string(),
+        "hermes".to_string(),
+        Some("hermes/migi-default".to_string()),
+        Some("parent-run".to_string()),
+        None,
+        Some(ShellType::Zsh),
+        Some(working_dir),
+        Arc::new(ai_client),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        prepared.command,
+        "hermes chat --quiet --model hermes/migi-default --query 'hello world'"
+    );
 }
 
 #[tokio::test]

@@ -3,6 +3,8 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use instant::Duration;
+use url::Url;
+use warp_core::channel::{Channel, ChannelState};
 use warp_server_client::auth::{AgentIdentity, AuthEvent};
 use warp_server_client::base_client::BaseClient;
 
@@ -24,6 +26,18 @@ struct AgentIdentitiesResponse {
     agents: Vec<AgentIdentity>,
 }
 
+fn hermes_native_selfhost_graphql_mode() -> bool {
+    Channel::hermes_native_mode_enabled()
+        && ChannelState::channel().allows_server_url_overrides()
+        && Url::parse(ChannelState::server_root_url().as_ref())
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+            })
+            .is_some_and(|host| host != "warp.dev" && !host.ends_with(".warp.dev"))
+}
+
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl BaseClient for ServerApi {
@@ -43,6 +57,13 @@ impl BaseClient for ServerApi {
         &self,
         timeout: Option<Duration>,
     ) -> Result<warp_graphql::client::RequestOptions> {
+        if hermes_native_selfhost_graphql_mode() {
+            return Ok(warp_graphql::client::RequestOptions {
+                timeout,
+                ..default_request_options()
+            });
+        }
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await

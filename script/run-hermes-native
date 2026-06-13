@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run the OSS Warp client in Hermes-native self-host mode.
+# Override these with Tailscale URLs when the gateway/relay is running off-host.
+export WARP_HERMES_NATIVE="${WARP_HERMES_NATIVE:-1}"
+export WARP_SERVER_ROOT_URL="${WARP_SERVER_ROOT_URL:-http://127.0.0.1:8976}"
+export WARP_WS_SERVER_URL="${WARP_WS_SERVER_URL:-ws://127.0.0.1:8976/graphql/v2}"
+export WARP_SESSION_SHARING_SERVER_URL="${WARP_SESSION_SHARING_SERVER_URL:-ws://127.0.0.1:8976}"
+
+printf 'Hermes-native Warp mode enabled\n' >&2
+printf '  WARP_SERVER_ROOT_URL=%s\n' "$WARP_SERVER_ROOT_URL" >&2
+printf '  WARP_WS_SERVER_URL=%s\n' "$WARP_WS_SERVER_URL" >&2
+printf '  WARP_SESSION_SHARING_SERVER_URL=%s\n' "$WARP_SESSION_SHARING_SERVER_URL" >&2
+
+if [[ "${WARP_HERMES_NATIVE_SKIP_GATEWAY_CHECK:-0}" != "1" ]]; then
+  python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+root = os.environ["WARP_SERVER_ROOT_URL"].rstrip("/")
+health_url = root + "/healthz"
+try:
+    with urllib.request.urlopen(health_url, timeout=2) as response:
+        health = json.load(response)
+except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+    raise SystemExit(
+        "Hermes Warp gateway is not ready at "
+        + health_url
+        + f": {exc}\nStart it with `script/run-hermes-warp-gateway`, or set "
+        + "WARP_HERMES_NATIVE_SKIP_GATEWAY_CHECK=1 to bypass this guard."
+    )
+
+if health.get("service") != "hermes-warp-gateway":
+    raise SystemExit(
+        f"{health_url} did not identify as hermes-warp-gateway; "
+        "check WARP_SERVER_ROOT_URL or set "
+        "WARP_HERMES_NATIVE_SKIP_GATEWAY_CHECK=1 to bypass this guard."
+    )
+PY
+fi
+
+exec cargo run --features with_local_server -- "$@"

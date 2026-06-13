@@ -1,0 +1,22 @@
+[Unit]
+Description=Hermes-native Warp compatibility gateway
+Documentation=https://github.com/joe25211/warp/blob/hermes-native-selfhost/tools/hermes_warp_gateway.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HERMES_WARP_GATEWAY_REPO=%h/Projects/warp-hermes-native
+EnvironmentFile=-%h/.config/hermes-warp-gateway/env
+WorkingDirectory=%h
+ExecStart=/usr/bin/env bash -lc 'cd "$HERMES_WARP_GATEWAY_REPO" && exec python3 tools/hermes_warp_gateway.py'
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/hermes-warp-gateway
+
+[Install]
+WantedBy=default.target

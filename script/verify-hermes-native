@@ -1,0 +1,556 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+printf '%s\n' '== format =='
+./script/format
+
+printf '%s\n' '== warp_core channel tests =='
+cargo test -p warp_core channel:: -- --nocapture
+
+printf '%s\n' '== warp_core check =='
+cargo check -p warp_core
+
+printf '%s\n' '== app check =='
+cargo check -p warp
+
+printf '%s\n' '== gateway smoke =='
+python - <<'PY'
+import base64
+import hashlib
+import json
+import os
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    env = os.environ.copy()
+    db_path = os.path.join(tmpdir, 'drive.sqlite')
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    smoke_model = f'hermes/smoke-{port}'
+
+    printed_env = subprocess.check_output(
+        [
+            sys.executable,
+            'tools/hermes_warp_gateway.py',
+            '--host',
+            '127.0.0.1',
+            '--port',
+            str(port),
+            '--db',
+            db_path,
+            '--default-model',
+            smoke_model,
+            '--session-sharing-url',
+            f'ws://127.0.0.1:{port}',
+            '--print-env',
+        ],
+        text=True,
+    )
+    printed_env_default_relay = subprocess.check_output(
+        [
+            sys.executable,
+            'tools/hermes_warp_gateway.py',
+            '--host',
+            '127.0.0.1',
+            '--port',
+            str(port),
+            '--db',
+            db_path,
+            '--print-env',
+        ],
+        text=True,
+        env={key: value for key, value in env.items() if key != 'WARP_SESSION_SHARING_SERVER_URL'},
+    )
+    invalid_session_url = subprocess.run(
+        [
+            sys.executable,
+            'tools/hermes_warp_gateway.py',
+            '--session-sharing-url',
+            f'ws://127.0.0.1:{port}/sessions',
+            '--print-env',
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert invalid_session_url.returncode != 0, invalid_session_url.stdout + invalid_session_url.stderr
+    assert f'WARP_SERVER_ROOT_URL=http://127.0.0.1:{port}' in printed_env
+    assert f'WARP_WS_SERVER_URL=ws://127.0.0.1:{port}/graphql/v2' in printed_env
+    assert f'WARP_SESSION_SHARING_SERVER_URL=ws://127.0.0.1:{port}' in printed_env
+    assert f'WARP_SESSION_SHARING_SERVER_URL=ws://127.0.0.1:{port}' in printed_env_default_relay
+    assert 'sessions.app.warp.dev' not in printed_env
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            'tools/hermes_warp_gateway.py',
+            '--host',
+            '127.0.0.1',
+            '--port',
+            str(port),
+            '--db',
+            db_path,
+            '--default-model',
+            smoke_model,
+            '--session-sharing-url',
+            f'ws://127.0.0.1:{port}',
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    try:
+        last = ''
+        for _ in range(50):
+            if proc.poll() is not None:
+                output = proc.stdout.read() if proc.stdout is not None else ''
+                raise SystemExit(f'gateway exited early with {proc.returncode}: {output}')
+            try:
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=1) as response:
+                    health = json.load(response)
+                break
+            except Exception as exc:
+                last = repr(exc)
+                time.sleep(0.1)
+        else:
+            raise SystemExit('gateway did not become ready: ' + last)
+
+        def graphql(operation, query, variables=None):
+            data = json.dumps({
+                'operationName': operation,
+                'query': query,
+                'variables': variables or {},
+            }).encode()
+            request = urllib.request.Request(
+                f'http://127.0.0.1:{port}/graphql/v2',
+                data=data,
+                headers={'content-type': 'application/json'},
+                method='POST',
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return json.load(response)
+
+        def request_json(method, path, payload=None):
+            data = None if payload is None else json.dumps(payload).encode()
+            request = urllib.request.Request(
+                f'http://127.0.0.1:{port}' + path,
+                data=data,
+                headers={'content-type': 'application/json'},
+                method=method,
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return json.load(response)
+
+        def request_text(method, path, payload=None):
+            data = None if payload is None else json.dumps(payload).encode()
+            request = urllib.request.Request(
+                f'http://127.0.0.1:{port}' + path,
+                data=data,
+                headers={'content-type': 'application/json'},
+                method=method,
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return response.read().decode()
+
+        def ws_send_text(sock, payload):
+            raw = payload.encode()
+            mask = os.urandom(4)
+            header = bytearray([0x81])
+            if len(raw) < 126:
+                header.append(0x80 | len(raw))
+            elif len(raw) < 65536:
+                header.append(0x80 | 126)
+                header.extend(struct.pack('!H', len(raw)))
+            else:
+                header.append(0x80 | 127)
+                header.extend(struct.pack('!Q', len(raw)))
+            masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(raw))
+            sock.sendall(bytes(header) + mask + masked)
+
+        def ws_send_ping(sock, payload=b'probe'):
+            mask = os.urandom(4)
+            masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+            sock.sendall(bytes([0x89, 0x80 | len(payload)]) + mask + masked)
+
+        def recv_exact(sock, size):
+            chunks = bytearray()
+            while len(chunks) < size:
+                chunk = sock.recv(size - len(chunks))
+                if not chunk:
+                    raise AssertionError(f'short websocket read: wanted {size}, got {len(chunks)}')
+                chunks.extend(chunk)
+            return bytes(chunks)
+
+        def ws_read_frame(sock):
+            header = recv_exact(sock, 2)
+            first, second = header
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack('!H', recv_exact(sock, 2))[0]
+            elif length == 127:
+                length = struct.unpack('!Q', recv_exact(sock, 8))[0]
+            payload = recv_exact(sock, length) if length else b''
+            return first & 0x0F, payload
+
+        def ws_read_text(sock):
+            opcode, payload = ws_read_frame(sock)
+            assert opcode == 0x1, f'unexpected websocket opcode {opcode}'
+            return payload.decode()
+
+        def ws_expect_no_frame(sock, label):
+            previous_timeout = sock.gettimeout()
+            sock.settimeout(0.2)
+            try:
+                try:
+                    opcode, payload = ws_read_frame(sock)
+                except socket.timeout:
+                    return
+                raise AssertionError(f'{label} unexpectedly received opcode={opcode} payload={payload!r}')
+            finally:
+                sock.settimeout(previous_timeout)
+
+        def relay_row_count():
+            with sqlite3.connect(db_path) as conn:
+                return conn.execute('SELECT COUNT(*) FROM session_relays').fetchone()[0]
+
+        def initialize_message(source_task_id='task-smoke'):
+            return {
+                'Initialize': {
+                    'source_task_id': source_task_id,
+                    'scrollback': {'blocks': []},
+                    'active_prompt': None,
+                    'window_size': {'cols': 80, 'rows': 24},
+                    'user_id': 'local-test-user',
+                    'selection': 'None',
+                    'init_block_id': 'block-smoke',
+                    'input_replica_id': '',
+                    'telemetry_context': None,
+                    'source_type': 'User',
+                    'feature_support': {},
+                }
+            }
+
+        def ws_connect(path, protocol=None):
+            sock = socket.create_connection(('127.0.0.1', port), timeout=3)
+            key = base64.b64encode(os.urandom(16)).decode()
+            protocol_header = f'Sec-WebSocket-Protocol: {protocol}\r\n' if protocol else ''
+            request = (
+                f'GET {path} HTTP/1.1\r\n'
+                f'Host: 127.0.0.1:{port}\r\n'
+                'Upgrade: websocket\r\n'
+                'Connection: Upgrade\r\n'
+                f'Sec-WebSocket-Key: {key}\r\n'
+                'Sec-WebSocket-Version: 13\r\n'
+                f'{protocol_header}\r\n'
+            )
+            sock.sendall(request.encode())
+            response = b''
+            while b'\r\n\r\n' not in response:
+                response += sock.recv(4096)
+            status_line = response.split(b'\r\n', 1)[0]
+            assert status_line.startswith(b'HTTP/1.1 101 '), response.decode(errors='replace')
+            accept = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
+            assert f'sec-websocket-accept: {accept}'.lower() in response.decode(errors='replace').lower()
+            return sock
+
+        def graphql_ws_smoke():
+            sock = ws_connect('/graphql/v2', protocol='graphql-transport-ws')
+            try:
+                ws_send_text(sock, json.dumps({'type': 'connection_init', 'payload': {}}))
+                ack = json.loads(ws_read_text(sock))
+                ws_send_text(sock, json.dumps({'type': 'ping', 'payload': {'probe': True}}))
+                pong = json.loads(ws_read_text(sock))
+                ws_send_text(sock, json.dumps({'id': 'drive-smoke', 'type': 'subscribe', 'payload': {'query': 'subscription { warpDriveUpdates { __typename } }'}}))
+                ws_expect_no_frame(sock, 'graphql subscription should stay idle')
+                return ack, pong
+            finally:
+                sock.close()
+
+        def relay_create_smoke():
+            sock = ws_connect('/sessions/create')
+            try:
+                ws_send_text(sock, json.dumps(initialize_message()))
+                initialized = json.loads(ws_read_text(sock))
+                session_id = initialized['SessionInitialized']['session_id']
+                reconnect_token = initialized['SessionInitialized']['reconnect_token']
+                ws_send_text(sock, json.dumps({'Ping': {'data': [1, 2, 3]}}))
+                pong = json.loads(ws_read_text(sock))
+                ws_send_text(sock, json.dumps({'OrderedTerminalEvent': {'event_no': 7, 'event_type': {'PtyBytesRead': {'bytes': [104, 105]}}}}))
+                ack = json.loads(ws_read_text(sock))
+                ws_send_text(sock, json.dumps({'OrderedTerminalEvent': {'event_no': -1, 'event_type': {'PtyBytesRead': {'bytes': []}}}}))
+                ws_expect_no_frame(sock, 'negative event_no')
+                ws_send_text(sock, json.dumps({'OrderedTerminalEvent': {'event_no': True, 'event_type': {'PtyBytesRead': {'bytes': []}}}}))
+                ws_expect_no_frame(sock, 'bool event_no')
+                ws_send_text(sock, json.dumps({'Ping': {'data': [4]}}))
+                pong_after_invalid_events = json.loads(ws_read_text(sock))
+                return session_id, reconnect_token, initialized, pong, ack, pong_after_invalid_events
+            finally:
+                sock.close()
+
+        def relay_create_invalid_smoke():
+            invalid_payloads = [
+                'not json at all',
+                json.dumps({}),
+                json.dumps({'Ping': {'data': []}}),
+                json.dumps([]),
+            ]
+            failures = []
+            before = relay_row_count()
+            for payload in invalid_payloads:
+                sock = ws_connect('/sessions/create')
+                try:
+                    ws_send_text(sock, payload)
+                    failures.append(json.loads(ws_read_text(sock)))
+                finally:
+                    sock.close()
+            after = relay_row_count()
+            return before, after, failures
+
+        def relay_resume_smoke(session_id, reconnect_token):
+            sock = ws_connect(f'/sessions/{session_id}/resume')
+            try:
+                ws_send_ping(sock)
+                pong_opcode, pong_payload = ws_read_frame(sock)
+                assert pong_opcode == 0xA and pong_payload == b'probe'
+                ws_send_text(sock, json.dumps({'Reconnect': {'reconnect_token': reconnect_token}}))
+                return json.loads(ws_read_text(sock))
+            finally:
+                sock.close()
+
+        def relay_resume_failure_smoke(session_id, reconnect_payload):
+            sock = ws_connect(f'/sessions/{session_id}/resume')
+            try:
+                ws_send_text(sock, json.dumps({'Reconnect': reconnect_payload}))
+                return json.loads(ws_read_text(sock))
+            finally:
+                sock.close()
+
+        def relay_end_session_smoke():
+            sock = ws_connect('/sessions/create')
+            try:
+                ws_send_text(sock, json.dumps(initialize_message('task-end-smoke')))
+                initialized = json.loads(ws_read_text(sock))
+                session_id = initialized['SessionInitialized']['session_id']
+                reconnect_token = initialized['SessionInitialized']['reconnect_token']
+                ws_send_text(sock, json.dumps({'EndSession': {'reason': 'EndedBySharer'}}))
+                opcode, _ = ws_read_frame(sock)
+                assert opcode == 0x8, f'expected close frame after EndSession, got opcode {opcode}'
+                return session_id, reconnect_token
+            finally:
+                sock.close()
+
+        def relay_join_smoke(session_id):
+            sock = ws_connect(f'/sessions/join/{session_id}')
+            try:
+                ws_send_text(sock, json.dumps({'Initialize': {'viewer_id': 'viewer-smoke', 'last_received_event_no': None}}))
+                return json.loads(ws_read_text(sock))
+            finally:
+                sock.close()
+
+        harness = graphql(
+            'get_available_harnesses',
+            'query { user { __typename ... on UserOutput { user { availableHarnesses { harnesses { harness displayName enabled availableModels { id displayName reasoningLevel } } } } } } }',
+        )
+        models = graphql(
+            'free_available_models',
+            'query { freeAvailableModels { __typename ... on FreeAvailableModelsOutput { featureModelChoice { agentMode { defaultId choices { id displayName provider } } } } } }',
+        )
+        unknown = graphql('unknown_operation', 'query { unknown }')
+
+        created = request_json('POST', '/hermes/drive/objects', {
+            'objectType': 'workflow',
+            'title': 'Smoke workflow',
+            'content': 'echo hermes-warp-gateway',
+            'owner': 'local-test',
+        })['object']
+        fetched = request_json('GET', f"/hermes/drive/objects/{created['id']}")['object']
+        updated = request_json('PUT', f"/hermes/drive/objects/{created['id']}", {'content': 'echo updated'})['object']
+        listed = request_json('GET', '/hermes/drive/objects?objectType=workflow')['objects']
+
+        gql_workflow = graphql(
+            'createWorkflow',
+            'mutation createWorkflow($input: CreateWorkflowInput!) { createWorkflow(input: $input) { __typename ... on CreateWorkflowOutput { revisionTs workflow { data metadata { uid revisionTs } } } } }',
+            {'input': {'data': json.dumps({'name': 'GQL workflow', 'command': 'echo gql'}), 'entrypoint': 'command'}},
+        )
+        gql_workflow_uid = gql_workflow['data']['createWorkflow']['workflow']['metadata']['uid']
+        gql_workflow_update = graphql(
+            'updateWorkflow',
+            'mutation updateWorkflow($input: UpdateWorkflowInput!) { updateWorkflow(input: $input) { __typename ... on UpdateWorkflowOutput { update { __typename ... on ObjectUpdateSuccess { revisionTs } } } } }',
+            {'input': {'uid': gql_workflow_uid, 'data': json.dumps({'name': 'GQL workflow', 'command': 'echo updated'})}},
+        )
+        gql_prompt = graphql(
+            'createGenericStringObject',
+            'mutation createGenericStringObject($input: CreateGenericStringObjectInput!) { createGenericStringObject(input: $input) { __typename ... on CreateGenericStringObjectOutput { clientId genericStringObject { format serializedModel metadata { uid revisionTs } } } } }',
+            {'input': {'genericStringObject': {'format': 'JsonAIFact', 'serializedModel': json.dumps({'name': 'Smoke prompt', 'prompt': 'summarize this'}), 'clientId': 'prompt-smoke'}}},
+        )
+        gql_prompt_uid = gql_prompt['data']['createGenericStringObject']['genericStringObject']['metadata']['uid']
+        gql_prompt_update = graphql(
+            'updateGenericStringObject',
+            'mutation updateGenericStringObject($input: UpdateGenericStringObjectInput!) { updateGenericStringObject(input: $input) { __typename ... on UpdateGenericStringObjectOutput { update { __typename ... on ObjectUpdateSuccess { revisionTs } } } } }',
+            {'input': {'uid': gql_prompt_uid, 'serializedModel': json.dumps({'name': 'Smoke prompt', 'prompt': 'summarize this now'})}},
+        )
+        gql_cloud_object = graphql(
+            'getCloudObject',
+            'query getCloudObject($input: CloudObjectInput!) { cloudObject(input: $input) { __typename ... on CloudObjectOutput { object { __typename ... on Workflow { data metadata { uid } } ... on GenericStringObject { serializedModel metadata { uid } } } } } }',
+            {'input': {'uid': gql_workflow_uid}},
+        )
+        gql_updated = graphql(
+            'getUpdatedCloudObjects',
+            'query getUpdatedCloudObjects { updatedCloudObjects { __typename ... on UpdatedCloudObjectsOutput { workflows { data metadata { uid } } genericStringObjects { format serializedModel metadata { uid } } deletedObjectUids { workflowUids genericStringObjectUids } } } }',
+        )
+        task_create = graphql(
+            'createAgentTask',
+            'mutation createAgentTask($input: CreateAgentTaskInput!) { createAgentTask(input: $input) { __typename ... on CreateAgentTaskOutput { responseContext { serverVersion } taskId } } }',
+            {'input': {'prompt': 'launch Hermes smoke', 'agentConfigSnapshot': json.dumps({'harness': {'harness_type': 'hermes'}})}},
+        )
+        created_task_id = task_create['data']['createAgentTask']['taskId']
+        created_task_lookup = request_json('GET', f'/hermes/agent-tasks/{created_task_id}')['task']
+        task_update = graphql(
+            'updateAgentTask',
+            'mutation updateAgentTask($input: UpdateAgentTaskInput!) { updateAgentTask(input: $input) { __typename ... on UpdateAgentTaskOutput { responseContext { serverVersion } } } }',
+            {'input': {'taskId': 'task-smoke', 'sessionId': 'session-smoke', 'conversationId': 'conversation-smoke', 'taskState': 'IN_PROGRESS', 'statusMessage': {'message': 'sharing locally'}}},
+        )
+        task_lookup = request_json('GET', '/hermes/agent-tasks/task-smoke')['task']
+        gql_ws_ack, gql_ws_pong = graphql_ws_smoke()
+        relay_session_id, relay_reconnect_token, relay_initialized, relay_pong, relay_ack, relay_pong_after_invalid_events = relay_create_smoke()
+        invalid_create_before, invalid_create_after, invalid_create_failures = relay_create_invalid_smoke()
+        relay_resume = relay_resume_smoke(relay_session_id, relay_reconnect_token)
+        relay_wrong_token = relay_resume_failure_smoke(relay_session_id, {'reconnect_token': 'wrong-token'})
+        relay_missing_token = relay_resume_failure_smoke(relay_session_id, {})
+        relay_nonexistent = relay_resume_failure_smoke('missing-session', {'reconnect_token': 'token'})
+        ended_session_id, ended_reconnect_token = relay_end_session_smoke()
+        relay_ended_resume = relay_resume_failure_smoke(ended_session_id, {'reconnect_token': ended_reconnect_token})
+        relay_join = relay_join_smoke(relay_session_id)
+        relay_lookup = request_json('GET', f'/hermes/sessions/{relay_session_id}')
+        relay_events = request_json('GET', f'/hermes/sessions/{relay_session_id}/events')['events']
+        event_created = request_json('POST', '/hermes/sessions/session-smoke/events', {
+            'kind': 'terminal.output',
+            'taskId': 'task-smoke',
+            'payload': {'text': 'hello from self-host event journal'},
+        })['event']
+        session_lookup = request_json('GET', '/hermes/sessions/session-smoke')
+        session_events = request_json('GET', '/hermes/sessions/session-smoke/events')['events']
+        session_events_after = request_json(
+            'GET',
+            f"/hermes/sessions/session-smoke/events?after={event_created['eventId'] - 1}&limit=1",
+        )['events']
+        session_events_stream = request_text('GET', '/hermes/sessions/session-smoke/events/stream?once=1')
+        session_events_bad_after = request_json('GET', '/hermes/sessions/session-smoke/events?after=not-an-int&limit=1')['events']
+        session_page = urllib.request.urlopen(f'http://127.0.0.1:{port}/session/session-smoke', timeout=3).read().decode()
+
+        assert health['ok'] is True
+        assert health['sessionSharingUrl'] == f'ws://127.0.0.1:{port}'
+        assert 'warp.dev' not in json.dumps(harness).lower()
+        assert harness['data']['user']['user']['availableHarnesses']['harnesses'][0]['harness'] == 'HERMES'
+        assert 'Hermes / Migi' in json.dumps(harness)
+        assert 'Hermes / Migi' in json.dumps(models)
+        assert models['data']['freeAvailableModels']['featureModelChoice']['agentMode']['choices'][0]['id'] == models['data']['freeAvailableModels']['featureModelChoice']['agentMode']['defaultId']
+        assert models['data']['freeAvailableModels']['featureModelChoice']['agentMode']['choices'][0]['hostConfigs'][0]['modelRoutingHost'] == 'CUSTOM_ENDPOINT'
+        assert unknown.get('errors'), unknown
+        assert fetched['title'] == 'Smoke workflow'
+        assert updated['revision'] == created['revision'] + 1
+        assert any(obj['id'] == created['id'] for obj in listed)
+        assert gql_workflow_update['data']['updateWorkflow']['update']['__typename'] == 'ObjectUpdateSuccess'
+        assert gql_prompt['data']['createGenericStringObject']['clientId'] == 'prompt-smoke'
+        assert gql_prompt_update['data']['updateGenericStringObject']['update']['__typename'] == 'ObjectUpdateSuccess'
+        assert gql_cloud_object['data']['cloudObject']['object']['metadata']['uid'] == gql_workflow_uid
+        updated_payload = gql_updated['data']['updatedCloudObjects']
+        assert any(obj['metadata']['uid'] == gql_workflow_uid for obj in updated_payload['workflows'])
+        assert any(obj['metadata']['uid'] == gql_prompt_uid for obj in updated_payload['genericStringObjects'])
+        assert 'summarize this now' in json.dumps(updated_payload)
+        assert task_create['data']['createAgentTask']['__typename'] == 'CreateAgentTaskOutput'
+        assert created_task_lookup['taskId'] == created_task_id
+        assert created_task_lookup['taskState'] == 'CLAIMED'
+        assert task_update['data']['updateAgentTask']['__typename'] == 'UpdateAgentTaskOutput'
+        assert task_lookup['sessionId'] == 'session-smoke'
+        assert task_lookup['conversationId'] == 'conversation-smoke'
+        assert gql_ws_ack['type'] == 'connection_ack'
+        assert gql_ws_pong == {'type': 'pong', 'payload': {'probe': True}}
+        assert relay_initialized['SessionInitialized']['session_id'] == relay_session_id
+        assert relay_pong['Pong']['data'] == [1, 2, 3]
+        assert relay_ack['EventsProcessedAck']['latest_processed_event_no'] == 7
+        assert relay_pong_after_invalid_events['Pong']['data'] == [4]
+        assert invalid_create_before == invalid_create_after
+        assert all('FailedToInitializeSession' in failure for failure in invalid_create_failures), invalid_create_failures
+        assert all(
+            'InternalServerError' in failure['FailedToInitializeSession']['reason']
+            for failure in invalid_create_failures
+        ), invalid_create_failures
+        assert relay_resume['SessionReconnected']['last_received_event_no'] == 7
+        assert relay_wrong_token['FailedToReconnect']['reason'] == 'WrongReconnectionToken'
+        assert relay_missing_token['FailedToReconnect']['reason'] == 'WrongReconnectionToken'
+        assert relay_nonexistent['FailedToReconnect']['reason'] == 'SessionNotFound'
+        assert relay_ended_resume['FailedToReconnect']['reason'] == 'SessionNotFound'
+        assert relay_resume['SessionReconnected']['participant_list']['sharer']['info']['profile_data']['display_name'] == 'Hermes local sharer'
+        assert relay_join['FailedToJoin']['reason'] == 'Invalid'
+        assert relay_lookup['relay']['sessionId'] == relay_session_id
+        relay_ordered_events = [
+            event['payload']
+            for event in relay_events
+            if event['kind'] == 'relay.sharer.upstream'
+            and event['payload'].get('variant') == 'OrderedTerminalEvent'
+        ]
+        assert relay_ordered_events == [
+            {'variant': 'OrderedTerminalEvent', 'fields': ['event_no', 'event_type'], 'eventNo': 7}
+        ], relay_ordered_events
+        assert any(event['kind'] == 'relay.sharer.initialize' for event in relay_events)
+        assert any(event['kind'] == 'relay.sharer.upstream' for event in relay_events)
+        assert any(task['taskId'] == 'task-smoke' for task in session_lookup['tasks'])
+        assert any(event['kind'] == 'agent.task.updated' for event in session_lookup['events'])
+        assert any(event['kind'] == 'terminal.output' for event in session_events)
+        assert event_created['payload']['text'] == 'hello from self-host event journal'
+        assert [event['eventId'] for event in session_events] == sorted(event['eventId'] for event in session_events)
+        assert session_events_after[0]['eventId'] == event_created['eventId']
+        assert len(session_events_after) == 1
+        assert len(session_events_bad_after) == 1
+        assert 'event: agent.task.updated' in session_events_stream
+        assert 'event: terminal.output' in session_events_stream
+        assert 'data:' in session_events_stream
+        assert 'Session session-smoke' in session_page
+        assert 'Recent events' in session_page
+        assert '/hermes/sessions/session-smoke/events' in session_page
+        assert 'sessions.app.warp.dev' not in session_page
+        assert 'sessions.app.warp.dev' not in json.dumps(session_events).lower()
+        assert 'sessions.app.warp.dev' not in json.dumps(relay_events).lower()
+        gateway_source = Path('tools/hermes_warp_gateway.py').read_text()
+        assert 'MAX_WS_FRAME_BYTES = 128 * 1024 * 1024' in gateway_source
+        print('gateway smoke ok')
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+PY
+
+printf '%s\n' '== operator artifacts =='
+python - <<'PY'
+from pathlib import Path
+service = Path('tools/hermes-warp-gateway.service').read_text()
+env_example = Path('tools/hermes_warp_gateway.env.example').read_text()
+assert '/home/joe' not in service
+assert '/home/joe' not in env_example
+assert 'ExecStart=/usr/bin/env python3 %h/Projects/warp-hermes-native' not in service
+assert 'WorkingDirectory=%h/Projects/warp-hermes-native' not in service
+assert 'HERMES_WARP_GATEWAY_REPO' in service
+assert 'HERMES_WARP_GATEWAY_REPO' in env_example
+print('operator artifacts ok')
+PY
+
+printf '%s\n' '== diff hygiene =='
+git diff --check
+
+printf '%s\n' 'Hermes-native verification passed.'

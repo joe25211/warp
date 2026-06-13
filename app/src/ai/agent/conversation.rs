@@ -4029,6 +4029,7 @@ pub enum AIAgentHarness {
     ClaudeCode,
     Gemini,
     Codex,
+    Hermes,
     Unknown,
 }
 

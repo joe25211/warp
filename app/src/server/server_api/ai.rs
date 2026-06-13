@@ -14,7 +14,8 @@ use itertools::Itertools;
 #[cfg(test)]
 use mockall::automock;
 use prost::Message;
-use warp_core::channel::ChannelState;
+use url::Url;
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_core::report_error;
 use warp_graphql::ai::{AgentTaskState, PlatformErrorCode};
@@ -1652,7 +1653,7 @@ impl AIClient for ServerApi {
             request_context: get_request_context(),
         };
         let operation = GetAvailableHarnesses::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = send_hermes_native_or_authenticated_graphql(self, operation).await?;
 
         match response.user {
             warp_graphql::queries::get_available_harnesses::UserResult::UserOutput(output) => {
@@ -1852,7 +1853,7 @@ impl AIClient for ServerApi {
         };
 
         let operation = CreateAgentTask::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = send_hermes_native_or_authenticated_graphql(self, operation).await?;
 
         match response.create_agent_task {
             CreateAgentTaskResult::CreateAgentTaskOutput(output) => output
@@ -1890,7 +1891,7 @@ impl AIClient for ServerApi {
         };
 
         let operation = UpdateAgentTask::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = send_hermes_native_or_authenticated_graphql(self, operation).await?;
 
         match response.update_agent_task {
             UpdateAgentTaskResult::UpdateAgentTaskOutput(_) => Ok(()),
@@ -2907,12 +2908,56 @@ impl From<warp_graphql::workspace::DisableReason> for DisableReason {
 
 // Conversions for AIConversationMetadata from GraphQL types
 
+fn graphql_url_is_self_hosted(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        })
+        .is_some_and(|host| host != "warp.dev" && !host.ends_with(".warp.dev"))
+}
+
+fn server_root_url_is_self_hosted() -> bool {
+    graphql_url_is_self_hosted(ChannelState::server_root_url().as_ref())
+}
+
+fn hermes_native_selfhost_graphql_mode() -> bool {
+    Channel::hermes_native_mode_enabled()
+        && ChannelState::channel().allows_server_url_overrides()
+        && server_root_url_is_self_hosted()
+}
+
+async fn send_hermes_native_or_authenticated_graphql<'a, QF, O>(
+    server_api: &'a ServerApi,
+    operation: O,
+) -> anyhow::Result<QF>
+where
+    QF: 'a,
+    O: warp_graphql::client::Operation<QF> + Send + 'a,
+{
+    if hermes_native_selfhost_graphql_mode() {
+        return operation
+            .send_request(server_api.client.clone(), default_request_options())
+            .await?
+            .data
+            .ok_or_else(|| anyhow!("Missing data in Hermes-native GraphQL response"));
+    }
+
+    server_api.send_graphql_request(operation, None).await
+}
+
 fn convert_harness(harness: warp_graphql::ai::AgentHarness) -> AIAgentHarness {
     match harness {
         warp_graphql::ai::AgentHarness::Oz => AIAgentHarness::Oz,
         warp_graphql::ai::AgentHarness::ClaudeCode => AIAgentHarness::ClaudeCode,
         warp_graphql::ai::AgentHarness::Gemini => AIAgentHarness::Gemini,
         warp_graphql::ai::AgentHarness::Codex => AIAgentHarness::Codex,
+        warp_graphql::ai::AgentHarness::Other(value)
+            if value.eq_ignore_ascii_case("hermes") || value.eq_ignore_ascii_case("HERMES") =>
+        {
+            AIAgentHarness::Hermes
+        }
         warp_graphql::ai::AgentHarness::Other(value) => {
             report_error!(
                 anyhow!(
