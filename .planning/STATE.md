@@ -4,10 +4,15 @@
 GSD quick/nest is being used to continue the Hermes-native Warp fork. GSD state was initialized after prior product commits; earlier durable project state lives in `specs/hermes-native-selfhost/` and git history.
 
 ## Current branch
-`hermes-native-selfhost` in `/home/joe/Projects/warp-hermes-native`.
+`session-viewer-fanout-v0` in `/home/joe/Projects/warp-hermes-native`, based on merged `origin/master`.
 
 ## Approval gates
-Commit, push, upstream PR, deploy/restart, and destructive actions require Joe approval.
+Commit, push, upstream PR, deploy/restart, branch deletion, and destructive actions require Joe approval.
+
+## Quick Tasks In Progress
+| Date | Task | Summary |
+| --- | --- | --- |
+| 2026-06-12 | Session viewer fanout v0 | Implemented and verified downstream read-only viewer attach for the self-hosted session relay: existing sessions can be joined with empty/bounded v0 protocol scrollback, sanitized live `OrderedTerminalEvent` frames fan out to viewers, viewer control attempts do not mutate sharer state, and `EndSession` closes viewers. Ready for Joe approval to commit; no push/PR/deploy/restart performed. |
 
 ## Quick Tasks Completed
 | Date | Task | Summary |

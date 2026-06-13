@@ -6,6 +6,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 printf '%s\n' '== format =='
 ./script/format
 
+printf '%s\n' '== syntax =='
+python -m py_compile tools/hermes_warp_gateway.py
+bash -n script/verify-hermes-native
+bash -n script/run-hermes-native
+
 printf '%s\n' '== warp_core channel tests =='
 cargo test -p warp_core channel:: -- --nocapture
 
@@ -27,6 +32,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -209,6 +215,26 @@ with tempfile.TemporaryDirectory() as tmpdir:
             assert opcode == 0x1, f'unexpected websocket opcode {opcode}'
             return payload.decode()
 
+        def ws_read_text_bounded(sock, label, timeout=1.0):
+            previous_timeout = sock.gettimeout()
+            sock.settimeout(timeout)
+            try:
+                return ws_read_text(sock)
+            except socket.timeout as exc:
+                raise AssertionError(f'{label} timed out after {timeout}s') from exc
+            finally:
+                sock.settimeout(previous_timeout)
+
+        def ws_read_frame_bounded(sock, label, timeout=1.0):
+            previous_timeout = sock.gettimeout()
+            sock.settimeout(timeout)
+            try:
+                return ws_read_frame(sock)
+            except socket.timeout as exc:
+                raise AssertionError(f'{label} timed out after {timeout}s') from exc
+            finally:
+                sock.settimeout(previous_timeout)
+
         def ws_expect_no_frame(sock, label):
             previous_timeout = sock.gettimeout()
             sock.settimeout(0.2)
@@ -351,13 +377,127 @@ with tempfile.TemporaryDirectory() as tmpdir:
             finally:
                 sock.close()
 
+        def viewer_initialize_message(last_received_event_no=None):
+            return {
+                'Initialize': {
+                    'viewer_id': None,
+                    'user_id': 'local-viewer-user',
+                    'last_received_event_no': last_received_event_no,
+                    'latest_block_id': None,
+                    'telemetry_context': None,
+                    'feature_support': {},
+                }
+            }
+
         def relay_join_smoke(session_id):
             sock = ws_connect(f'/sessions/join/{session_id}')
             try:
-                ws_send_text(sock, json.dumps({'Initialize': {'viewer_id': 'viewer-smoke', 'last_received_event_no': None}}))
-                return json.loads(ws_read_text(sock))
+                ws_send_text(sock, json.dumps(viewer_initialize_message()))
+                return json.loads(ws_read_text_bounded(sock, 'viewer join'))
             finally:
                 sock.close()
+
+        def relay_join_failure_smoke(session_id):
+            sock = ws_connect(f'/sessions/join/{session_id}')
+            try:
+                ws_send_text(sock, json.dumps(viewer_initialize_message()))
+                failure = json.loads(ws_read_text_bounded(sock, 'viewer join failure'))
+                opcode, _ = ws_read_frame_bounded(sock, 'viewer join failure close')
+                assert opcode == 0x8, f'expected close frame after failed join, got opcode {opcode}'
+                return failure
+            finally:
+                sock.close()
+
+        def relay_viewer_fanout_smoke():
+            sharer = ws_connect('/sessions/create')
+            viewer = None
+            try:
+                ws_send_text(sharer, json.dumps(initialize_message('task-viewer-fanout')))
+                initialized = json.loads(ws_read_text_bounded(sharer, 'viewer fanout initialize'))
+                session_id = initialized['SessionInitialized']['session_id']
+                ws_send_text(sharer, json.dumps({'OrderedTerminalEvent': {'event_no': 11, 'event_type': {'PtyBytesRead': {'bytes': [98, 101, 102, 111, 114, 101]}}}}))
+                pre_join_ack = json.loads(ws_read_text_bounded(sharer, 'pre-join ack'))
+                assert pre_join_ack['EventsProcessedAck']['latest_processed_event_no'] == 11
+
+                viewer = ws_connect(f'/sessions/join/{session_id}')
+                ws_send_text(viewer, json.dumps(viewer_initialize_message()))
+                joined_text = ws_read_text_bounded(viewer, 'viewer join success')
+                joined = json.loads(joined_text)
+                assert 'JoinedSuccessfully' in joined, joined
+                joined_payload = joined['JoinedSuccessfully']
+                assert joined_payload['latest_event_no'] is None
+                assert joined_payload['scrollback'] == {'blocks': [], 'is_alt_screen_active': False}
+                assert joined_payload['participant_list']['present_viewers'][0]['max_acl'] == 'Reader'
+                assert 'reconnect_token' not in joined_text
+                assert 'session_secret' not in joined_text
+                assert initialized['SessionInitialized']['reconnect_token'] not in joined_text
+                assert initialized['SessionInitialized']['session_secret'] not in joined_text
+
+                unsafe_fanout = {
+                    'OrderedTerminalEvent': {'event_no': 12, 'event_type': {'PtyBytesRead': {'bytes': [117, 110, 115, 97, 102, 101]}}},
+                    'SessionInitialized': {
+                        'reconnect_token': initialized['SessionInitialized']['reconnect_token'],
+                        'session_secret': initialized['SessionInitialized']['session_secret'],
+                    },
+                }
+                ws_send_text(sharer, json.dumps(unsafe_fanout))
+                unsafe_ack = json.loads(ws_read_text_bounded(sharer, 'unsafe fanout ack'))
+                assert unsafe_ack['EventsProcessedAck']['latest_processed_event_no'] == 12
+                ws_expect_no_frame(viewer, 'unsafe multi-variant fanout should not reach viewer')
+
+                unsafe_single_variant = {
+                    'OrderedTerminalEvent': {
+                        'event_no': 13,
+                        'event_type': {'PtyBytesRead': {'bytes': [117, 110, 115, 97, 102, 101]}},
+                        'sessionSecret': initialized['SessionInitialized']['session_secret'],
+                        'opaqueEcho': initialized['SessionInitialized']['reconnect_token'],
+                    }
+                }
+                ws_send_text(sharer, json.dumps(unsafe_single_variant))
+                unsafe_single_ack = json.loads(ws_read_text_bounded(sharer, 'unsafe single-variant fanout ack'))
+                assert unsafe_single_ack['EventsProcessedAck']['latest_processed_event_no'] == 13
+                ws_expect_no_frame(viewer, 'unsafe token-bearing fanout should not reach viewer')
+
+                live_result = {}
+                def read_live_fanout():
+                    try:
+                        live_result['text'] = ws_read_text_bounded(viewer, 'live viewer fanout', 2.0)
+                    except BaseException as exc:  # noqa: BLE001 - preserve thread assertion for main thread
+                        live_result['error'] = repr(exc)
+
+                reader = threading.Thread(target=read_live_fanout, daemon=True)
+                reader.start()
+                live_event = {'OrderedTerminalEvent': {'event_no': 14, 'event_type': {'PtyBytesRead': {'bytes': [108, 105, 118, 101]}}}}
+                ws_send_text(sharer, json.dumps(live_event))
+                live_ack = json.loads(ws_read_text_bounded(sharer, 'live fanout ack'))
+                reader.join(2.5)
+                assert not reader.is_alive(), 'viewer fanout reader did not finish'
+                assert 'error' not in live_result, live_result
+                assert json.loads(live_result['text']) == live_event
+                assert live_ack['EventsProcessedAck']['latest_processed_event_no'] == 14
+
+                ws_send_text(viewer, json.dumps({'OrderedTerminalEvent': {'event_no': 99, 'event_type': {'PtyBytesRead': {'bytes': [120]}}}}))
+                ws_expect_no_frame(viewer, 'viewer control should not receive ack')
+                relay_lookup_after_viewer_control = request_json('GET', f'/hermes/sessions/{session_id}')
+                assert relay_lookup_after_viewer_control['relay']['lastEventNo'] == 14
+
+                ws_send_text(sharer, json.dumps({'EndSession': {'reason': 'EndedBySharer'}}))
+                ended = json.loads(ws_read_text_bounded(viewer, 'viewer SessionEnded'))
+                assert ended == {'SessionEnded': {'reason': 'EndedBySharer'}}
+                opcode, _ = ws_read_frame_bounded(viewer, 'viewer close after EndSession')
+                assert opcode == 0x8, f'expected viewer close frame after EndSession, got opcode {opcode}'
+                sharer_opcode, _ = ws_read_frame_bounded(sharer, 'sharer close after EndSession')
+                assert sharer_opcode == 0x8, f'expected sharer close frame after EndSession, got opcode {sharer_opcode}'
+                ended_join = relay_join_failure_smoke(session_id)
+                ended_resume = relay_resume_failure_smoke(
+                    session_id,
+                    {'reconnect_token': initialized['SessionInitialized']['reconnect_token']},
+                )
+                return session_id, joined, json.loads(live_result['text']), ended, ended_join, ended_resume
+            finally:
+                if viewer is not None:
+                    viewer.close()
+                sharer.close()
 
         harness = graphql(
             'get_available_harnesses',
@@ -433,7 +573,10 @@ with tempfile.TemporaryDirectory() as tmpdir:
         ended_session_id, ended_reconnect_token = relay_end_session_smoke()
         relay_ended_resume = relay_resume_failure_smoke(ended_session_id, {'reconnect_token': ended_reconnect_token})
         relay_join = relay_join_smoke(relay_session_id)
+        relay_join_missing = relay_join_failure_smoke('missing-session')
+        viewer_fanout_session_id, viewer_fanout_join, viewer_fanout_live, viewer_fanout_ended, viewer_fanout_ended_join, viewer_fanout_ended_resume = relay_viewer_fanout_smoke()
         relay_lookup = request_json('GET', f'/hermes/sessions/{relay_session_id}')
+        relay_page = urllib.request.urlopen(f'http://127.0.0.1:{port}/session/{relay_session_id}', timeout=3).read().decode()
         relay_events = request_json('GET', f'/hermes/sessions/{relay_session_id}/events')['events']
         event_created = request_json('POST', '/hermes/sessions/session-smoke/events', {
             'kind': 'terminal.output',
@@ -494,8 +637,26 @@ with tempfile.TemporaryDirectory() as tmpdir:
         assert relay_nonexistent['FailedToReconnect']['reason'] == 'SessionNotFound'
         assert relay_ended_resume['FailedToReconnect']['reason'] == 'SessionNotFound'
         assert relay_resume['SessionReconnected']['participant_list']['sharer']['info']['profile_data']['display_name'] == 'Hermes local sharer'
-        assert relay_join['FailedToJoin']['reason'] == 'Invalid'
+        assert 'JoinedSuccessfully' in relay_join
+        assert relay_join['JoinedSuccessfully']['scrollback'] == {'blocks': [], 'is_alt_screen_active': False}
+        assert relay_join['JoinedSuccessfully']['latest_event_no'] is None
+        assert relay_join['JoinedSuccessfully']['participant_list']['present_viewers'][0]['max_acl'] == 'Reader'
+        relay_join_text = json.dumps(relay_join)
+        assert relay_reconnect_token not in relay_join_text
+        assert relay_initialized['SessionInitialized']['session_secret'] not in relay_join_text
+        assert relay_join_missing['FailedToJoin']['reason'] == 'SessionNotFound'
+        assert 'JoinedSuccessfully' in viewer_fanout_join
+        assert viewer_fanout_live['OrderedTerminalEvent']['event_no'] == 14
+        assert viewer_fanout_ended == {'SessionEnded': {'reason': 'EndedBySharer'}}
+        assert viewer_fanout_ended_join['FailedToJoin']['reason'] == 'SessionNotFound'
+        assert viewer_fanout_ended_resume['FailedToReconnect']['reason'] == 'SessionNotFound'
+        assert viewer_fanout_session_id
         assert relay_lookup['relay']['sessionId'] == relay_session_id
+        relay_lookup_text = json.dumps(relay_lookup)
+        assert relay_reconnect_token not in relay_lookup_text
+        assert relay_initialized['SessionInitialized']['session_secret'] not in relay_lookup_text
+        assert relay_reconnect_token not in relay_page
+        assert relay_initialized['SessionInitialized']['session_secret'] not in relay_page
         relay_ordered_events = [
             event['payload']
             for event in relay_events

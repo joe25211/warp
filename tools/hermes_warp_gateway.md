@@ -30,7 +30,7 @@ Current surface:
   - WebSocket relay adapter routes on `WARP_SESSION_SHARING_SERVER_URL`:
     - `/sessions/create` creates a local relay record, returns session/reconnect credentials, journals initialization, and accepts ping/terminal-event upstream messages
     - `/sessions/<session_id>/resume` validates the reconnect token and returns the latest processed terminal event number
-    - `/sessions/join/<session_id>` is explicitly handled and journals viewer attempts, but returns `FailedToJoin` until downstream event fanout is implemented
+    - `/sessions/join/<session_id>` attaches read-only viewers to an existing relay, returns protocol-shaped `JoinedSuccessfully` with empty/bounded v0 scrollback, and receives allowlisted live `OrderedTerminalEvent` fanout
   - `GET /session/<session_id>` renders a small public-safe local handoff page
 
 Unknown GraphQL operations return an explicit error. The gateway should not fabricate Warp cloud state.
@@ -106,11 +106,11 @@ Run the repo-local verification script:
 script/verify-hermes-native
 ```
 
-It formats the repo, checks the Rust app, starts the gateway on an isolated smoke-test port with a temporary SQLite database, verifies model/harness GraphQL responses, verifies REST Drive object create/read/update/list, verifies GraphQL workflow and generic prompt-like object create/read/update/list, verifies `updateAgentTask` task/session binding, verifies session event journal append/list/SSE backlog behavior, verifies the WebSocket relay adapter for `/sessions/create`, reconnect-token-gated `/sessions/<id>/resume`, and explicit `/sessions/join/<id>` failure handling, verifies `/hermes/sessions/<id>` and `/session/<id>`, and runs `git diff --check`.
+It formats the repo, checks the Rust app, starts the gateway on an isolated smoke-test port with a temporary SQLite database, verifies model/harness GraphQL responses, verifies REST Drive object create/read/update/list, verifies GraphQL workflow and generic prompt-like object create/read/update/list, verifies `updateAgentTask` task/session binding, verifies session event journal append/list/SSE backlog behavior, verifies the WebSocket relay adapter for `/sessions/create`, reconnect-token-gated `/sessions/<id>/resume`, read-only `/sessions/join/<id>` viewer attach with empty/bounded v0 scrollback and live allowlisted `OrderedTerminalEvent` fanout, verifies viewer control attempts do not update relay state, verifies `EndSession` closes joined viewers, verifies `/hermes/sessions/<id>` and `/session/<id>`, and runs `git diff --check`.
 
 ## Next seams
 
 - Replace the prototype GraphQL string router with typed resolvers backed by Hermes config/provider state.
 - Patch the client cloud-object paths to use the Drive object compatibility layer.
-- Add downstream viewer fanout plus scrollback/event catch-up over the session relay.
+- Add real protocol scrollback/event catch-up and participant ACL/identity binding over the session relay.
 - Bind participant state/ACLs to Herdr/Hermes session identity and expose dashboard join/watch/steer links.

@@ -35,11 +35,11 @@ Joe wants a Warp Terminal fork that keeps the useful terminal/workspace/Drive/se
 8. Hermes/Migi is available as a first-class local harness option, including the `migi` alias.
 9. The gateway has a repo-local launch script, env example, user systemd unit, and operator docs.
 10. The docs cache under `~/.hermes/knowledge/warp-hermes-native/` records the Warp cloud/session/Drive docs used as source material.
-11. The gateway now has a self-host session-sharing registry, event journal v0, and relay adapter v0: `updateAgentTask` can persist a task/session/conversation binding locally, append an `agent.task.updated` event, expose session events through JSON/SSE endpoints, `/sessions/create` can initialize a local relay record over WebSocket, `/sessions/<id>/resume` is reconnect-token-gated, `/sessions/join/<id>` fails explicitly until viewer fanout exists, and `/session/<session_id>` gives a local/Tailscale handoff page instead of a Warp-hosted share surface.
+11. The gateway now has a self-host session-sharing registry, event journal v0, relay adapter v0, and read-only viewer fanout v0: `updateAgentTask` can persist a task/session/conversation binding locally, append an `agent.task.updated` event, expose session events through JSON/SSE endpoints, `/sessions/create` can initialize a local relay record over WebSocket, `/sessions/<id>/resume` is reconnect-token-gated, `/sessions/join/<id>` returns protocol-shaped `JoinedSuccessfully` with empty/bounded v0 scrollback, live allowlisted `OrderedTerminalEvent` frames fan out to joined viewers, viewer-originated control does not mutate sharer relay state, and `/session/<session_id>` gives a local/Tailscale handoff page instead of a Warp-hosted share surface.
 
 ## Later milestones
 - Replace the prototype `hermes-warp-gateway` with a typed service and GraphQL-compatible resolvers for login-free local workspace state, Drive object sync, harness catalog, and model list.
 - Replace Warp account/team assumptions with local workspace ACLs using Tailscale identity and/or Hermes profile identity.
 - Expand Drive compatibility beyond first-pass workflow/generic prompt-like objects into notebooks, env vars, folders, permissions, and deletion/conflict semantics.
-- Complete the relay beyond adapter v0 with downstream viewer fanout, catch-up scrollback/event replay, participant state, Herdr/Migi session identity binding, and expose join/watch/steer links on the Tailscale dashboard.
+- Complete the relay beyond adapter v0 with real protocol scrollback/event catch-up, participant state, Herdr/Migi session identity binding, and expose join/watch/steer links on the Tailscale dashboard.
 - Add migration/import for existing Warp Drive objects from local SQLite and/or exported files.

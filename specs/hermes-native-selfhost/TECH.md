@@ -99,7 +99,7 @@ The gateway must eventually provide:
   - WebSocket session relay adapter on the `WARP_SESSION_SHARING_SERVER_URL` seam:
     - `/sessions/create` creates a local relay record, returns session/reconnect credentials, journals the sharer `Initialize`, accepts app-level `Ping`, and acknowledges `OrderedTerminalEvent` messages while updating `last_event_no`
     - `/sessions/<session_id>/resume` validates the reconnect token and returns `SessionReconnected` with the last processed event number
-    - `/sessions/join/<session_id>` is route-compatible and journals viewer attempts, but still returns `FailedToJoin` until downstream event fanout/viewer catch-up is implemented
+    - `/sessions/join/<session_id>` validates an existing relay, returns protocol-shaped `JoinedSuccessfully` with empty/bounded v0 scrollback, registers a read-only viewer socket, and receives live allowlisted `OrderedTerminalEvent` fanout from the sharer
   - `GET /session/<session_id>` for a minimal local/Tailscale handoff page
 - REST Drive seam:
   - `GET /hermes/drive/objects`
@@ -147,13 +147,13 @@ Verify the slice end-to-end:
 script/verify-hermes-native
 ```
 
-This runs formatting, channel tests, `cargo check -p warp_core`, `cargo check -p warp`, gateway smoke checks for model/harness GraphQL responses, REST Drive object create/read/update/list, GraphQL workflow and generic prompt-like object create/read/update/list, `updateAgentTask` task/session binding, session event journal append/list/SSE backlog behavior, the WebSocket relay adapter for `/sessions/create`, reconnect-token-gated `/sessions/<id>/resume`, and explicit `/sessions/join/<id>` failure handling, and `git diff --check`.
+This runs formatting, channel tests, `cargo check -p warp_core`, `cargo check -p warp`, gateway smoke checks for model/harness GraphQL responses, REST Drive object create/read/update/list, GraphQL workflow and generic prompt-like object create/read/update/list, `updateAgentTask` task/session binding, session event journal append/list/SSE backlog behavior, the WebSocket relay adapter for `/sessions/create`, reconnect-token-gated `/sessions/<id>/resume`, read-only `/sessions/join/<id>` viewer attach with empty/bounded v0 scrollback and live allowlisted `OrderedTerminalEvent` fanout, viewer-control rejection, `EndSession` viewer close behavior, and `git diff --check`.
 
 ## Hermes harness polish
 `crates/warp_cli/src/agent.rs` now has a first-class `Harness::Hermes` selectable as `hermes` or `migi`. The app maps it through CLI-agent selection, display, setup readiness, local child task config, ambient-agent selection, and auth-secret bypass paths. Hermes is intentionally local-first and does not request Warp-managed harness secrets.
 
 ## Next implementation slices
 1. Replace the prototype gateway with a typed service and real GraphQL schema/resolvers backed by Hermes config/provider state.
-2. Complete the session relay beyond adapter v0: downstream viewer fanout, catch-up scrollback/event replay, participant state, and Herdr/Hermes session identity binding.
+2. Complete the session relay beyond viewer fanout v0: real protocol scrollback/event catch-up, full participant state, and Herdr/Hermes session identity binding.
 3. Expand Drive compatibility beyond workflow and generic prompt-like objects into notebooks, env vars, folders, permissions, and deletion/conflict semantics.
 4. Add integration tests proving Hermes-native mode does not contact `*.warp.dev` for harness/model/session sharing paths.
