@@ -620,6 +620,25 @@ pub fn run() -> Result<()> {
         }
     }
 
+    if warp_core::channel::Channel::hermes_native_mode_enabled()
+        && ChannelState::channel().allows_server_url_overrides()
+    {
+        let session_url = ChannelState::session_sharing_server_url()
+            .ok_or_else(|| anyhow!("WARP_HERMES_NATIVE requires WARP_SESSION_SHARING_SERVER_URL to point at a self-host relay"))?;
+        let session_url = Url::parse(session_url.as_ref()).map_err(|e| {
+            anyhow!("Invalid WARP_SESSION_SHARING_SERVER_URL for Hermes-native mode: {e:#}")
+        })?;
+        let host = session_url
+            .host_str()
+            .map(|host| host.to_ascii_lowercase())
+            .ok_or_else(|| anyhow!("WARP_SESSION_SHARING_SERVER_URL must include a host"))?;
+        if host == "warp.dev" || host.ends_with(".warp.dev") {
+            return Err(anyhow!(
+                "WARP_HERMES_NATIVE requires a self-host WARP_SESSION_SHARING_SERVER_URL; refusing Warp-hosted session relay {host}"
+            ));
+        }
+    }
+
     if let Some(command) = args.command() {
         #[cfg(windows)]
         if command.prints_to_stdout() {

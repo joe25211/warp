@@ -32,7 +32,10 @@ HERMES_BASE_URL = os.environ.get("HERMES_BASE_URL", "http://127.0.0.1:9120")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8787/v1")
 DEFAULT_MODEL = os.environ.get("HERMES_WARP_DEFAULT_MODEL", "hermes/migi-default")
 SESSION_SHARING_URL = os.environ.get("WARP_SESSION_SHARING_SERVER_URL", "ws://127.0.0.1:8976")
-MAX_WS_FRAME_BYTES = 1 << 20  # 1 MiB; enough for relay control frames, bounded for LAN/Tailscale abuse.
+# Match Warp's default shared-session size budget so ordinary Initialize frames with
+# scrollback can be accepted and journaled by the v0 relay instead of being dropped
+# before the protocol can answer.
+MAX_WS_FRAME_BYTES = 128 * 1024 * 1024
 DB_PATH = Path(
     os.environ.get(
         "HERMES_WARP_GATEWAY_DB",
@@ -1144,7 +1147,7 @@ class Handler(BaseHTTPRequestHandler):
     def _is_websocket_request(self) -> bool:
         return self.headers.get("upgrade", "").lower() == "websocket"
 
-    def _send_websocket_handshake(self) -> bool:
+    def _send_websocket_handshake(self, protocol: str | None = None) -> bool:
         key = self.headers.get("sec-websocket-key")
         if not key:
             self._send_json(400, {"error": "missing sec-websocket-key"})
@@ -1153,8 +1156,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("upgrade", "websocket")
         self.send_header("connection", "Upgrade")
         self.send_header("sec-websocket-accept", _websocket_accept_key(key))
+        requested_protocols = {
+            value.strip()
+            for value in self.headers.get("sec-websocket-protocol", "").split(",")
+            if value.strip()
+        }
+        if protocol and protocol in requested_protocols:
+            self.send_header("sec-websocket-protocol", protocol)
         self.end_headers()
         return True
+
+    def _handle_graphql_websocket(self) -> None:
+        if not self._send_websocket_handshake("graphql-transport-ws"):
+            return
+        self.close_connection = True
+        while True:
+            message = _read_ws_text(self.rfile, self.wfile)
+            if message is None:
+                return
+            try:
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                _write_ws_close(self.wfile)
+                return
+            message_type = payload.get("type")
+            if message_type == "connection_init":
+                _write_ws_text(self.wfile, json.dumps({"type": "connection_ack"}, separators=(",", ":")))
+            elif message_type == "ping":
+                response = {"type": "pong"}
+                if "payload" in payload:
+                    response["payload"] = payload["payload"]
+                _write_ws_text(self.wfile, json.dumps(response, separators=(",", ":")))
+            elif message_type == "complete":
+                _write_ws_close(self.wfile)
+                return
+            elif message_type == "subscribe":
+                # v0 has no live Drive fanout yet. Keep the subscription open after ack
+                # so Warp's listener has a valid local websocket instead of a 404/retry loop.
+                continue
 
     def _handle_session_websocket(self, parsed: Any) -> None:
         parts = parsed.path.strip("/").split("/")
@@ -1298,6 +1337,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
+        if self._is_websocket_request() and parsed.path == "/graphql/v2":
+            self._handle_graphql_websocket()
+            return
         if self._is_websocket_request() and parsed.path.startswith("/sessions/"):
             self._handle_session_websocket(parsed)
             return

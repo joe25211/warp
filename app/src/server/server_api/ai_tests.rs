@@ -5,13 +5,30 @@ use super::super::base_client::CLOUD_AGENT_ID_HEADER;
 use super::super::ServerApi;
 use super::{
     build_fork_conversation_url, build_list_agent_runs_url, build_run_followup_url,
-    AgentMessageHeader, AgentRunEvent, AgentSource, AmbientAgentTaskState, Artifact,
-    ArtifactDownloadResponse, ArtifactType, ConnectedSelfHostedWorker, ExecutionLocation,
-    ForkConversationResponse, ListConnectedSelfHostedWorkersResponse, ListRunsResponse,
-    ReadAgentMessageResponse, RunFollowupRequest, RunSortBy, RunSortOrder, SpawnAgentRequest,
-    TaskListFilter, UserQueryMode, CONNECTED_SELF_HOSTED_WORKERS_PATH,
+    graphql_url_is_self_hosted, AgentMessageHeader, AgentRunEvent, AgentSource,
+    AmbientAgentTaskState, Artifact, ArtifactDownloadResponse, ArtifactType,
+    ConnectedSelfHostedWorker, ExecutionLocation, ForkConversationResponse,
+    ListConnectedSelfHostedWorkersResponse, ListRunsResponse, ReadAgentMessageResponse,
+    RunFollowupRequest, RunSortBy, RunSortOrder, SpawnAgentRequest, TaskListFilter, UserQueryMode,
+    CONNECTED_SELF_HOSTED_WORKERS_PATH,
 };
 use crate::notebooks::NotebookId;
+
+#[test]
+fn hermes_native_graphql_endpoint_guard_rejects_warp_hosts() {
+    assert!(!graphql_url_is_self_hosted(
+        "https://app.warp.dev/graphql/v2"
+    ));
+    assert!(!graphql_url_is_self_hosted(
+        "https://staging.warp.dev/graphql/v2"
+    ));
+    assert!(graphql_url_is_self_hosted(
+        "http://127.0.0.1:8976/graphql/v2"
+    ));
+    assert!(graphql_url_is_self_hosted(
+        "https://tower.tailb0557b.ts.net/graphql/v2"
+    ));
+}
 
 #[test]
 fn ambient_agent_headers_for_task_overrides_existing_cloud_agent_header() {

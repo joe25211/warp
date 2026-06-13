@@ -14,6 +14,7 @@ use itertools::Itertools;
 #[cfg(test)]
 use mockall::automock;
 use prost::Message;
+use url::Url;
 use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_core::report_error;
@@ -2907,8 +2908,21 @@ impl From<warp_graphql::workspace::DisableReason> for DisableReason {
 
 // Conversions for AIConversationMetadata from GraphQL types
 
+fn graphql_url_is_self_hosted(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| host != "warp.dev" && !host.ends_with(".warp.dev"))
+}
+
+fn server_root_url_is_self_hosted() -> bool {
+    graphql_url_is_self_hosted(ChannelState::server_root_url().as_ref())
+}
+
 fn hermes_native_selfhost_graphql_mode() -> bool {
-    Channel::hermes_native_mode_enabled() && ChannelState::channel().allows_server_url_overrides()
+    Channel::hermes_native_mode_enabled()
+        && ChannelState::channel().allows_server_url_overrides()
+        && server_root_url_is_self_hosted()
 }
 
 async fn send_hermes_native_or_authenticated_graphql<'a, QF, O>(

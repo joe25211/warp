@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from pathlib import Path
 
 with tempfile.TemporaryDirectory() as tmpdir:
     env = os.environ.copy()
@@ -241,16 +242,18 @@ with tempfile.TemporaryDirectory() as tmpdir:
                 }
             }
 
-        def ws_connect(path):
+        def ws_connect(path, protocol=None):
             sock = socket.create_connection(('127.0.0.1', port), timeout=3)
             key = base64.b64encode(os.urandom(16)).decode()
+            protocol_header = f'Sec-WebSocket-Protocol: {protocol}\r\n' if protocol else ''
             request = (
                 f'GET {path} HTTP/1.1\r\n'
                 f'Host: 127.0.0.1:{port}\r\n'
                 'Upgrade: websocket\r\n'
                 'Connection: Upgrade\r\n'
                 f'Sec-WebSocket-Key: {key}\r\n'
-                'Sec-WebSocket-Version: 13\r\n\r\n'
+                'Sec-WebSocket-Version: 13\r\n'
+                f'{protocol_header}\r\n'
             )
             sock.sendall(request.encode())
             response = b''
@@ -261,6 +264,19 @@ with tempfile.TemporaryDirectory() as tmpdir:
             accept = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
             assert f'sec-websocket-accept: {accept}'.lower() in response.decode(errors='replace').lower()
             return sock
+
+        def graphql_ws_smoke():
+            sock = ws_connect('/graphql/v2', protocol='graphql-transport-ws')
+            try:
+                ws_send_text(sock, json.dumps({'type': 'connection_init', 'payload': {}}))
+                ack = json.loads(ws_read_text(sock))
+                ws_send_text(sock, json.dumps({'type': 'ping', 'payload': {'probe': True}}))
+                pong = json.loads(ws_read_text(sock))
+                ws_send_text(sock, json.dumps({'id': 'drive-smoke', 'type': 'subscribe', 'payload': {'query': 'subscription { warpDriveUpdates { __typename } }'}}))
+                ws_expect_no_frame(sock, 'graphql subscription should stay idle')
+                return ack, pong
+            finally:
+                sock.close()
 
         def relay_create_smoke():
             sock = ws_connect('/sessions/create')
@@ -407,6 +423,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
             {'input': {'taskId': 'task-smoke', 'sessionId': 'session-smoke', 'conversationId': 'conversation-smoke', 'taskState': 'IN_PROGRESS', 'statusMessage': {'message': 'sharing locally'}}},
         )
         task_lookup = request_json('GET', '/hermes/agent-tasks/task-smoke')['task']
+        gql_ws_ack, gql_ws_pong = graphql_ws_smoke()
         relay_session_id, relay_reconnect_token, relay_initialized, relay_pong, relay_ack, relay_pong_after_invalid_events = relay_create_smoke()
         invalid_create_before, invalid_create_after, invalid_create_failures = relay_create_invalid_smoke()
         relay_resume = relay_resume_smoke(relay_session_id, relay_reconnect_token)
@@ -459,6 +476,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         assert task_update['data']['updateAgentTask']['__typename'] == 'UpdateAgentTaskOutput'
         assert task_lookup['sessionId'] == 'session-smoke'
         assert task_lookup['conversationId'] == 'conversation-smoke'
+        assert gql_ws_ack['type'] == 'connection_ack'
+        assert gql_ws_pong == {'type': 'pong', 'payload': {'probe': True}}
         assert relay_initialized['SessionInitialized']['session_id'] == relay_session_id
         assert relay_pong['Pong']['data'] == [1, 2, 3]
         assert relay_ack['EventsProcessedAck']['latest_processed_event_no'] == 7
@@ -505,6 +524,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         assert 'sessions.app.warp.dev' not in session_page
         assert 'sessions.app.warp.dev' not in json.dumps(session_events).lower()
         assert 'sessions.app.warp.dev' not in json.dumps(relay_events).lower()
+        gateway_source = Path('tools/hermes_warp_gateway.py').read_text()
+        assert 'MAX_WS_FRAME_BYTES = 128 * 1024 * 1024' in gateway_source
         print('gateway smoke ok')
     finally:
         proc.terminate()

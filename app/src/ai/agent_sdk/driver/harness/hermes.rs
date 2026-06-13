@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use shell_words::quote as shell_quote;
 use tempfile::NamedTempFile;
 use warp_cli::agent::Harness;
 use warp_managed_secrets::ManagedSecretValue;
@@ -79,11 +80,15 @@ impl ThirdPartyHarness for HermesHarness {
 }
 
 fn hermes_command(cli_name: &str, prompt_path: &str, model_id: Option<&str>) -> String {
+    let quoted_prompt_path = shell_quote(prompt_path);
     match model_id.filter(|id| !id.is_empty()) {
-        Some(model_id) => format!(
-            "{cli_name} chat --quiet --model '{model_id}' --query \"$(cat '{prompt_path}')\""
-        ),
-        None => format!("{cli_name} chat --quiet --query \"$(cat '{prompt_path}')\""),
+        Some(model_id) => {
+            let quoted_model = shell_quote(model_id);
+            format!(
+                "{cli_name} chat --quiet --model {quoted_model} --query \"$(cat {quoted_prompt_path})\""
+            )
+        }
+        None => format!("{cli_name} chat --quiet --query \"$(cat {quoted_prompt_path})\""),
     }
 }
 
@@ -175,7 +180,15 @@ mod tests {
     fn hermes_command_passes_model_when_selected() {
         assert_eq!(
             hermes_command("hermes", "/tmp/prompt.txt", Some("hermes/migi-default")),
-            "hermes chat --quiet --model 'hermes/migi-default' --query \"$(cat '/tmp/prompt.txt')\""
+            "hermes chat --quiet --model hermes/migi-default --query \"$(cat /tmp/prompt.txt)\""
+        );
+    }
+
+    #[test]
+    fn hermes_command_quotes_model_when_selected() {
+        assert_eq!(
+            hermes_command("hermes", "/tmp/prompt.txt", Some("hermes/migi's default")),
+            "hermes chat --quiet --model 'hermes/migi'\\''s default' --query \"$(cat /tmp/prompt.txt)\""
         );
     }
 
@@ -183,7 +196,7 @@ mod tests {
     fn hermes_command_omits_empty_model() {
         assert_eq!(
             hermes_command("hermes", "/tmp/prompt.txt", Some("")),
-            "hermes chat --quiet --query \"$(cat '/tmp/prompt.txt')\""
+            "hermes chat --quiet --query \"$(cat /tmp/prompt.txt)\""
         );
     }
 }
