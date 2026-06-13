@@ -14,7 +14,7 @@ use itertools::Itertools;
 #[cfg(test)]
 use mockall::automock;
 use prost::Message;
-use warp_core::channel::ChannelState;
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_core::report_error;
 use warp_graphql::ai::{AgentTaskState, PlatformErrorCode};
@@ -1852,7 +1852,17 @@ impl AIClient for ServerApi {
         };
 
         let operation = CreateAgentTask::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = if Channel::hermes_native_mode_enabled()
+            && ChannelState::channel().allows_server_url_overrides()
+        {
+            operation
+                .send_request(self.client.clone(), default_request_options())
+                .await?
+                .data
+                .ok_or_else(|| anyhow!("Missing data in createAgentTask response"))?
+        } else {
+            self.send_graphql_request(operation, None).await?
+        };
 
         match response.create_agent_task {
             CreateAgentTaskResult::CreateAgentTaskOutput(output) => output

@@ -49,8 +49,12 @@ pub struct HarnessAvailability {
 /// never seed the UI with Warp-hosted Oz/cloud models. The self-hosted Hermes compatibility server
 /// must provide the harness list, or the UI should show no built-in cloud agent surface rather than
 /// silently falling back to Warp-hosted infrastructure.
+fn hermes_native_harness_mode_enabled() -> bool {
+    Channel::hermes_native_mode_enabled() && ChannelState::channel().allows_server_url_overrides()
+}
+
 fn default_harnesses() -> Vec<HarnessAvailability> {
-    if Channel::hermes_native_mode_enabled() {
+    if hermes_native_harness_mode_enabled() {
         return vec![];
     }
 
@@ -112,7 +116,7 @@ pub struct HarnessAvailabilityModel {
 
 impl HarnessAvailabilityModel {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let harnesses = if Channel::hermes_native_mode_enabled() {
+        let harnesses = if hermes_native_harness_mode_enabled() {
             default_harnesses()
         } else {
             get_cached(ctx).unwrap_or_else(default_harnesses)
@@ -360,7 +364,7 @@ impl HarnessAvailabilityModel {
         // Normal Warp cloud `user` queries require auth. In Hermes-native self-host mode the
         // compatibility gateway serves the same shape locally so the harness picker can populate
         // before any Warp login exists.
-        if !Channel::hermes_native_mode_enabled()
+        if !hermes_native_harness_mode_enabled()
             && !AuthStateProvider::as_ref(ctx).get().is_logged_in()
         {
             return;

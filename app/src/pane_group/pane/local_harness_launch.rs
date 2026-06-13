@@ -135,8 +135,12 @@ pub(super) fn build_local_codex_child_command(prompt: &str) -> String {
     format!("codex --dangerously-bypass-approvals-and-sandbox {quoted_prompt}")
 }
 
-pub(super) fn build_local_hermes_child_command(prompt: &str) -> String {
+pub(super) fn build_local_hermes_child_command(prompt: &str, model_id: Option<&str>) -> String {
     let quoted_prompt = shell_quote(prompt);
+    if let Some(model_id) = model_id.filter(|id| !id.is_empty()) {
+        let quoted_model = shell_quote(model_id);
+        return format!("hermes chat --quiet --model {quoted_model} --query {quoted_prompt}");
+    }
     format!("hermes chat --quiet --query {quoted_prompt}")
 }
 
@@ -247,7 +251,12 @@ pub(super) async fn prepare_local_harness_child_launch(
         Harness::Hermes => {
             validate_cli_installed("hermes", Some("https://hermes-agent.nousresearch.com/docs"))
                 .map_err(|error: AgentDriverError| error.to_string())?;
-            build_local_hermes_child_command(&prompt)
+            build_local_hermes_child_command(
+                &prompt,
+                harness_model_config
+                    .as_ref()
+                    .map(|config| config.model_id.as_str()),
+            )
         }
         Harness::Gemini => unreachable!("normalize_local_child_harness filters out Gemini"),
     };
@@ -276,6 +285,7 @@ pub(super) async fn prepare_local_harness_child_launch(
         remove_claude_externally_managed_listener_env_vars(&mut env_vars);
     }
     // Propagate the selected model to Claude Code via ANTHROPIC_MODEL.
+    // Hermes receives its selected model as a CLI flag in build_local_hermes_child_command.
     // Codex local children never receive a model override — the UI
     // ensures model_id is empty for local Codex.
     env_vars.extend(harness_model_env_vars(

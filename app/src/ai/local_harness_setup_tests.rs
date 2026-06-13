@@ -32,7 +32,7 @@ fn hermes_requires_cli() {
     assert_eq!(
         local_harness_setup_state_with_cli_resolver(Harness::Hermes, |_| false),
         LocalHarnessSetupState::MissingHarness {
-            tooltip: LOCAL_HARNESS_INSTALLATION_REQUIRED_TOOLTIP,
+            tooltip: LOCAL_HERMES_HARNESS_INSTALLATION_REQUIRED_TOOLTIP,
         }
     );
 }

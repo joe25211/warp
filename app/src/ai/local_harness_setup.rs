@@ -7,6 +7,8 @@ use crate::util::path::resolve_executable;
 /// Tooltip shown when a local harness is product-enabled but its CLI is missing.
 pub(crate) const LOCAL_HARNESS_INSTALLATION_REQUIRED_TOOLTIP: &str =
     "Install Claude Code to use this local harness.";
+pub(crate) const LOCAL_HERMES_HARNESS_INSTALLATION_REQUIRED_TOOLTIP: &str =
+    "Install Hermes Agent to use this local harness.";
 pub(crate) const LOCAL_CODEX_HARNESS_INSTALLATION_REQUIRED_TOOLTIP: &str =
     "Install Codex to use this local harness.";
 pub(crate) const LOCAL_CODEX_HARNESS_DISABLED_MESSAGE: &str =
@@ -76,7 +78,7 @@ fn local_harness_setup_state_with_cli_resolver(
             tooltip: LOCAL_CODEX_HARNESS_INSTALLATION_REQUIRED_TOOLTIP,
         },
         Harness::Hermes if !cli_is_installed("hermes") => LocalHarnessSetupState::MissingHarness {
-            tooltip: LOCAL_HARNESS_INSTALLATION_REQUIRED_TOOLTIP,
+            tooltip: LOCAL_HERMES_HARNESS_INSTALLATION_REQUIRED_TOOLTIP,
         },
         Harness::Oz
         | Harness::Claude
