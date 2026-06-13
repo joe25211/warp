@@ -1652,7 +1652,7 @@ impl AIClient for ServerApi {
             request_context: get_request_context(),
         };
         let operation = GetAvailableHarnesses::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = send_hermes_native_or_authenticated_graphql(self, operation).await?;
 
         match response.user {
             warp_graphql::queries::get_available_harnesses::UserResult::UserOutput(output) => {
@@ -1852,17 +1852,7 @@ impl AIClient for ServerApi {
         };
 
         let operation = CreateAgentTask::build(variables);
-        let response = if Channel::hermes_native_mode_enabled()
-            && ChannelState::channel().allows_server_url_overrides()
-        {
-            operation
-                .send_request(self.client.clone(), default_request_options())
-                .await?
-                .data
-                .ok_or_else(|| anyhow!("Missing data in createAgentTask response"))?
-        } else {
-            self.send_graphql_request(operation, None).await?
-        };
+        let response = send_hermes_native_or_authenticated_graphql(self, operation).await?;
 
         match response.create_agent_task {
             CreateAgentTaskResult::CreateAgentTaskOutput(output) => output
@@ -1900,7 +1890,7 @@ impl AIClient for ServerApi {
         };
 
         let operation = UpdateAgentTask::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = send_hermes_native_or_authenticated_graphql(self, operation).await?;
 
         match response.update_agent_task {
             UpdateAgentTaskResult::UpdateAgentTaskOutput(_) => Ok(()),
@@ -2916,6 +2906,29 @@ impl From<warp_graphql::workspace::DisableReason> for DisableReason {
 }
 
 // Conversions for AIConversationMetadata from GraphQL types
+
+fn hermes_native_selfhost_graphql_mode() -> bool {
+    Channel::hermes_native_mode_enabled() && ChannelState::channel().allows_server_url_overrides()
+}
+
+async fn send_hermes_native_or_authenticated_graphql<'a, QF, O>(
+    server_api: &'a ServerApi,
+    operation: O,
+) -> anyhow::Result<QF>
+where
+    QF: 'a,
+    O: warp_graphql::client::Operation<QF> + Send + 'a,
+{
+    if hermes_native_selfhost_graphql_mode() {
+        return operation
+            .send_request(server_api.client.clone(), default_request_options())
+            .await?
+            .data
+            .ok_or_else(|| anyhow!("Missing data in Hermes-native GraphQL response"));
+    }
+
+    server_api.send_graphql_request(operation, None).await
+}
 
 fn convert_harness(harness: warp_graphql::ai::AgentHarness) -> AIAgentHarness {
     match harness {

@@ -1,6 +1,6 @@
 use warp_cli::agent::Harness;
 
-use super::{auth_check_command_for, validate_cli_installed};
+use super::{auth_check_command_for, harness_kind, validate_cli_installed, HarnessKind};
 use crate::ai::agent_sdk::driver::AgentDriverError;
 
 fn assert_harness_setup_failed(err: &AgentDriverError) -> (&str, &str) {
@@ -74,6 +74,14 @@ fn auth_check_command_for_unsupported_is_none() {
     // OpenCode is mapped to HarnessKind::Unsupported and therefore has no
     // auth check command of its own.
     assert!(auth_check_command_for(Harness::OpenCode).is_none());
+}
+
+#[test]
+fn harness_kind_for_hermes_is_real_third_party_harness() {
+    assert!(matches!(
+        harness_kind(Harness::Hermes),
+        Ok(HarnessKind::ThirdParty(_))
+    ));
 }
 
 #[test]

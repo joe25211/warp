@@ -377,7 +377,9 @@ impl HarnessAvailabilityModel {
                 Ok(new_harnesses) => {
                     if new_harnesses != me.harnesses {
                         me.harnesses = new_harnesses;
-                        me.cache(ctx);
+                        if !hermes_native_harness_mode_enabled() {
+                            me.cache(ctx);
+                        }
                         // Invalidate cached auth secrets so the next menu open refetches.
                         let stale: Vec<Harness> = me.auth_secrets.keys().copied().collect();
                         for harness in stale {
