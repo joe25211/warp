@@ -17,8 +17,10 @@ import hashlib
 import html
 import json
 import os
+import socket
 import sqlite3
 import struct
+import threading
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +44,33 @@ DB_PATH = Path(
         str(Path.home() / ".local/share/hermes-warp-gateway/drive.sqlite"),
     )
 )
+_VIEWER_SEND_TIMEOUT_SECONDS = 1.0
+_VIEWER_FANOUT_VARIANTS = {"OrderedTerminalEvent"}
+_VIEWER_HUB_LOCK = threading.Lock()
+_VIEWER_HUB: dict[str, dict[str, "_ViewerConnection"]] = {}
+_VIEWER_HUB_CLOSING: set[str] = set()
+
+
+class _ViewerConnection:
+    def __init__(
+        self,
+        session_id: str,
+        viewer_id: str,
+        wfile: Any,
+        connection: Any,
+        next_event_no: int = 0,
+    ) -> None:
+        self.session_id = session_id
+        self.viewer_id = viewer_id
+        self.wfile = wfile
+        self.connection = connection
+        self.write_lock = threading.Lock()
+        self.alive = True
+        # The prototype gateway does not persist protocol-faithful scrollback yet.
+        # Each viewer therefore sees an empty snapshot and a contiguous, viewer-local
+        # live stream starting at event 0, even if the sharer has already emitted
+        # historical events that cannot be replayed.
+        self.next_event_no = next_event_no
 
 
 def _port(value: str) -> int:
@@ -128,10 +157,31 @@ def _connect() -> sqlite3.Connection:
             sharer_firebase_uid TEXT NOT NULL,
             last_event_no INTEGER,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            active_prompt TEXT,
+            window_rows INTEGER,
+            window_cols INTEGER,
+            init_block_id TEXT,
+            input_replica_id TEXT,
+            source_type TEXT,
+            detailed_source_type TEXT,
+            source_task_id TEXT
         )
         """
     )
+    relay_columns = {row["name"] for row in conn.execute("PRAGMA table_info(session_relays)")}
+    for column, ddl in {
+        "active_prompt": "ALTER TABLE session_relays ADD COLUMN active_prompt TEXT",
+        "window_rows": "ALTER TABLE session_relays ADD COLUMN window_rows INTEGER",
+        "window_cols": "ALTER TABLE session_relays ADD COLUMN window_cols INTEGER",
+        "init_block_id": "ALTER TABLE session_relays ADD COLUMN init_block_id TEXT",
+        "input_replica_id": "ALTER TABLE session_relays ADD COLUMN input_replica_id TEXT",
+        "source_type": "ALTER TABLE session_relays ADD COLUMN source_type TEXT",
+        "detailed_source_type": "ALTER TABLE session_relays ADD COLUMN detailed_source_type TEXT",
+        "source_task_id": "ALTER TABLE session_relays ADD COLUMN source_task_id TEXT",
+    }.items():
+        if column not in relay_columns:
+            conn.execute(ddl)
     return conn
 
 
@@ -337,6 +387,16 @@ def _row_to_session_relay(row: sqlite3.Row) -> dict[str, Any]:
         "lastEventNo": row["last_event_no"],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
+        "activePrompt": row["active_prompt"] or "PS1",
+        "windowRows": row["window_rows"] or 24,
+        "windowCols": row["window_cols"] or 80,
+        "initBlockId": row["init_block_id"] or "hermes-local-viewer-init",
+        "inputReplicaId": row["input_replica_id"] or "",
+        "sourceType": row["source_type"] or "User",
+        "detailedSourceType": json.loads(row["detailed_source_type"])
+        if row["detailed_source_type"]
+        else "User",
+        "sourceTaskId": row["source_task_id"],
     }
 
 
@@ -356,8 +416,9 @@ def _delete_session_relay(session_id: str) -> None:
         conn.execute("DELETE FROM session_relays WHERE session_id = ?", (session_id,))
 
 
-def _create_session_relay() -> dict[str, str]:
+def _create_session_relay(first_message: str) -> dict[str, str]:
     timestamp = _now()
+    metadata = _extract_sharer_initialize_metadata(first_message)
     relay = {
         "sessionId": str(uuid.uuid4()),
         "sessionSecret": str(uuid.uuid4()),
@@ -370,8 +431,9 @@ def _create_session_relay() -> dict[str, str]:
             """
             INSERT INTO session_relays (
                 session_id, session_secret, reconnect_token, sharer_id, sharer_firebase_uid,
-                last_event_no, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                last_event_no, created_at, updated_at, active_prompt, window_rows, window_cols,
+                init_block_id, input_replica_id, source_type, detailed_source_type, source_task_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 relay["sessionId"],
@@ -382,6 +444,14 @@ def _create_session_relay() -> dict[str, str]:
                 None,
                 timestamp,
                 timestamp,
+                metadata["activePrompt"],
+                metadata["windowRows"],
+                metadata["windowCols"],
+                metadata["initBlockId"],
+                metadata["inputReplicaId"],
+                metadata["sourceType"],
+                json.dumps(metadata["detailedSourceType"], separators=(",", ":")),
+                metadata["sourceTaskId"],
             ),
         )
     return relay
@@ -407,13 +477,27 @@ def _participant_info(participant_id: str, firebase_uid: str, display_name: str)
     }
 
 
-def _relay_participant_list(relay: dict[str, Any] | sqlite3.Row) -> dict[str, Any]:
+def _viewer_participant_info(viewer_id: str, viewer_firebase_uid: str) -> dict[str, Any]:
+    return _participant_info(viewer_id, viewer_firebase_uid, "Hermes local viewer")
+
+
+def _relay_participant_list(
+    relay: dict[str, Any] | sqlite3.Row,
+    viewer_id: str | None = None,
+    viewer_firebase_uid: str | None = None,
+) -> dict[str, Any]:
     sharer_id = str(_relay_field(relay, "sharerId", "sharer_id"))
     firebase_uid = str(_relay_field(relay, "sharerFirebaseUid", "sharer_firebase_uid"))
+    viewers: list[dict[str, Any]] = []
+    present_viewers: list[dict[str, Any]] = []
+    if viewer_id is not None and viewer_firebase_uid is not None:
+        viewer_info = _viewer_participant_info(viewer_id, viewer_firebase_uid)
+        viewers.append({"info": viewer_info, "role": "Reader", "is_present": True})
+        present_viewers.append({"info": viewer_info, "max_acl": "Reader"})
     return {
         "sharer": {"info": _participant_info(sharer_id, firebase_uid, "Hermes local sharer")},
-        "viewers": [],
-        "present_viewers": [],
+        "viewers": viewers,
+        "present_viewers": present_viewers,
         "absent_viewers": [],
         "guests": [],
         "pending_guests": [],
@@ -436,6 +520,71 @@ def _update_relay_last_event(session_id: str, event_no: int | None) -> None:
             """,
             (event_no, event_no, _now(), session_id),
         )
+
+
+def _initialize_payload(raw_message: str) -> dict[str, Any] | None:
+    message = _parse_relay_message(raw_message)
+    init = message.get("Initialize") if message else None
+    return init if isinstance(init, dict) else None
+
+
+def _window_dimension(window_size: Any, canonical_key: str, legacy_key: str, fallback: int) -> int:
+    if isinstance(window_size, dict):
+        value = window_size.get(canonical_key, window_size.get(legacy_key))
+        if type(value) is int and value > 0:
+            return value
+    return fallback
+
+
+def _source_metadata(init: dict[str, Any]) -> tuple[str, Any, str | None]:
+    source_task_id = init.get("source_task_id")
+    source_task_id = source_task_id if isinstance(source_task_id, str) and source_task_id else None
+    detailed_source_type: Any = init.get("source_type") or "User"
+    if isinstance(detailed_source_type, dict) and isinstance(detailed_source_type.get("AmbientAgent"), dict):
+        task_id = detailed_source_type["AmbientAgent"].get("task_id")
+        if source_task_id is None and isinstance(task_id, str) and task_id:
+            source_task_id = task_id
+        return "AmbientAgent", detailed_source_type, source_task_id
+    if detailed_source_type == "AmbientAgent":
+        if source_task_id:
+            return "AmbientAgent", {"AmbientAgent": {"task_id": source_task_id}}, source_task_id
+        return "AmbientAgent", "AmbientAgent", source_task_id
+    return "User", "User", source_task_id
+
+
+def _extract_sharer_initialize_metadata(raw_message: str) -> dict[str, Any]:
+    init = _initialize_payload(raw_message) or {}
+    window_size = init.get("window_size")
+    legacy_source, detailed_source, source_task_id = _source_metadata(init)
+    active_prompt = init.get("active_prompt") or "PS1"
+    if not isinstance(active_prompt, str):
+        active_prompt = "PS1"
+    init_block_id = init.get("init_block_id") or "hermes-local-viewer-init"
+    if not isinstance(init_block_id, str):
+        init_block_id = "hermes-local-viewer-init"
+    input_replica_id = init.get("input_replica_id") or ""
+    if not isinstance(input_replica_id, str):
+        input_replica_id = ""
+    return {
+        "activePrompt": active_prompt,
+        "windowRows": _window_dimension(window_size, "num_rows", "rows", 24),
+        "windowCols": _window_dimension(window_size, "num_cols", "cols", 80),
+        "initBlockId": init_block_id,
+        "inputReplicaId": input_replica_id,
+        "sourceType": legacy_source,
+        "detailedSourceType": detailed_source,
+        "sourceTaskId": source_task_id,
+    }
+
+
+def _extract_viewer_initialize_metadata(raw_message: str) -> dict[str, Any]:
+    init = _initialize_payload(raw_message) or {}
+    viewer_id = init.get("viewer_id")
+    last_received = init.get("last_received_event_no")
+    return {
+        "viewerId": viewer_id if isinstance(viewer_id, str) and viewer_id else None,
+        "lastReceivedEventNo": last_received if type(last_received) is int and last_received >= 0 else None,
+    }
 
 
 def _relay_message_summary(raw_message: str) -> dict[str, Any]:
@@ -481,6 +630,45 @@ def _extract_ordered_event_no(raw_message: str) -> int | None:
     return None
 
 
+def _json_contains_secret_marker(value: Any, forbidden_values: set[str] | None = None) -> bool:
+    forbidden_values = {item for item in (forbidden_values or set()) if item}
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized_key = "".join(char for char in str(key).lower() if char.isalnum())
+            if normalized_key in {"reconnecttoken", "sessionsecret"}:
+                return True
+            if _json_contains_secret_marker(nested, forbidden_values):
+                return True
+    elif isinstance(value, list):
+        return any(_json_contains_secret_marker(item, forbidden_values) for item in value)
+    elif isinstance(value, str) and value in forbidden_values:
+        return True
+    return False
+
+
+def _viewer_safe_ordered_terminal_event(raw_message: str, forbidden_values: set[str] | None = None) -> str | None:
+    message = _parse_relay_message(raw_message)
+    if message is None or set(message.keys()) != {"OrderedTerminalEvent"}:
+        return None
+    event = message.get("OrderedTerminalEvent")
+    if not isinstance(event, dict) or _extract_ordered_event_no(raw_message) is None:
+        return None
+    if _json_contains_secret_marker(event, forbidden_values):
+        return None
+    safe_message = json.dumps({"OrderedTerminalEvent": event}, separators=(",", ":"))
+    safe_message_lower = safe_message.lower()
+    if (
+        "reconnect_token" in safe_message_lower
+        or "reconnecttoken" in safe_message_lower
+        or "session_secret" in safe_message_lower
+        or "sessionsecret" in safe_message_lower
+    ):
+        return None
+    if any(secret and secret in safe_message for secret in (forbidden_values or set())):
+        return None
+    return safe_message
+
+
 def _is_initialize_message(raw_message: str) -> bool:
     message = _parse_relay_message(raw_message)
     if message is None or set(message.keys()) != {"Initialize"}:
@@ -501,6 +689,237 @@ def _failed_to_initialize_message(details: str) -> str:
 
 def _failed_to_reconnect_message(reason: str) -> str:
     return json.dumps({"FailedToReconnect": {"reason": reason}}, separators=(",", ":"))
+
+
+def _failed_to_join_message(reason: str) -> str:
+    return json.dumps({"FailedToJoin": {"reason": reason}}, separators=(",", ":"))
+
+
+def _joined_successfully_message(
+    relay: dict[str, Any],
+    viewer_id: str,
+    viewer_firebase_uid: str,
+) -> str:
+    return json.dumps(
+        {
+            "JoinedSuccessfully": {
+                "scrollback": {"blocks": [], "is_alt_screen_active": False},
+                "active_prompt": relay.get("activePrompt") or "PS1",
+                # The v0 gateway does not reconstruct protocol scrollback from
+                # summary-only session_events. It sends viewer-local future
+                # OrderedTerminalEvent numbers starting at 0 instead of advertising
+                # historical catch-up it cannot replay.
+                "latest_event_no": None,
+                "window_size": {
+                    "num_rows": relay.get("windowRows") or 24,
+                    "num_cols": relay.get("windowCols") or 80,
+                },
+                "participant_list": _relay_participant_list(relay, viewer_id, viewer_firebase_uid),
+                "viewer_id": viewer_id,
+                "viewer_firebase_uid": viewer_firebase_uid,
+                "init_block_id": relay.get("initBlockId") or "hermes-local-viewer-init",
+                "input_replica_id": relay.get("inputReplicaId") or f"input-{viewer_id}",
+                "universal_developer_input_context": None,
+                "source_type": relay.get("sourceType") or "User",
+                "detailed_source_type": relay.get("detailedSourceType") or "User",
+                "source_task_id": relay.get("sourceTaskId"),
+            }
+        },
+        separators=(",", ":"),
+    )
+
+
+def _rejoined_successfully_message(relay: dict[str, Any]) -> str:
+    return json.dumps(
+        {"RejoinedSuccessfully": {"participant_list": _relay_participant_list(relay)}},
+        separators=(",", ":"),
+    )
+
+
+def _renumber_ordered_terminal_event(safe_message: str, event_no: int) -> str | None:
+    message = _parse_relay_message(safe_message)
+    event = message.get("OrderedTerminalEvent") if message else None
+    if not isinstance(event, dict):
+        return None
+    rewritten = dict(event)
+    rewritten["event_no"] = event_no
+    return json.dumps({"OrderedTerminalEvent": rewritten}, separators=(",", ":"))
+
+
+def _viewer_rejection_message(raw_message: str) -> str | None:
+    message = _parse_relay_message(raw_message)
+    if message is None or len(message) != 1:
+        return None
+    variant = next(iter(message.keys()))
+    payload = message.get(variant)
+    if variant == "UpdateInput" and isinstance(payload, dict) and isinstance(payload.get("id"), dict):
+        return json.dumps(
+            {"InputUpdateRejected": {"id": payload["id"], "reason": "InsufficientPermissions"}},
+            separators=(",", ":"),
+        )
+    if variant == "ExecuteCommand":
+        return json.dumps(
+            {
+                "CommandExecutionRequestFailed": {
+                    "id": str(uuid.uuid4()),
+                    "reason": "InsufficientPermissions",
+                }
+            },
+            separators=(",", ":"),
+        )
+    if variant == "WriteToPty":
+        return json.dumps(
+            {"WriteToPtyRequestFailed": {"reason": "InsufficientPermissions"}},
+            separators=(",", ":"),
+        )
+    if variant == "SendAgentPrompt":
+        return json.dumps(
+            {"AgentPromptRequestFailed": {"reason": "InsufficientPermissions"}},
+            separators=(",", ":"),
+        )
+    if variant in {"SendControlAction", "UpdateUniversalDeveloperInputContext"}:
+        return json.dumps(
+            {"ControlActionRequestFailed": {"reason": "InsufficientPermissions"}},
+            separators=(",", ":"),
+        )
+    return None
+
+
+def _extract_end_session_reason(raw_message: str) -> str:
+    message = _parse_relay_message(raw_message)
+    end = message.get("EndSession") if message else None
+    if isinstance(end, dict) and isinstance(end.get("reason"), str) and end["reason"]:
+        return end["reason"]
+    return "EndedBySharer"
+
+
+def _register_viewer(viewer: _ViewerConnection) -> bool:
+    with _VIEWER_HUB_LOCK:
+        if viewer.session_id in _VIEWER_HUB_CLOSING:
+            return False
+        _VIEWER_HUB.setdefault(viewer.session_id, {})[viewer.viewer_id] = viewer
+        return True
+
+
+def _deregister_viewer(
+    session_id: str, viewer_id: str, viewer: _ViewerConnection | None = None
+) -> None:
+    with _VIEWER_HUB_LOCK:
+        viewers = _VIEWER_HUB.get(session_id)
+        if not viewers:
+            return
+        if viewer is not None and viewers.get(viewer_id) is not viewer:
+            return
+        viewers.pop(viewer_id, None)
+        if not viewers:
+            _VIEWER_HUB.pop(session_id, None)
+
+
+def _session_viewers_snapshot(session_id: str) -> list[_ViewerConnection]:
+    with _VIEWER_HUB_LOCK:
+        return list(_VIEWER_HUB.get(session_id, {}).values())
+
+
+def _pop_session_viewers(session_id: str) -> list[_ViewerConnection]:
+    with _VIEWER_HUB_LOCK:
+        _VIEWER_HUB_CLOSING.add(session_id)
+        return list(_VIEWER_HUB.pop(session_id, {}).values())
+
+
+def _clear_session_closing(session_id: str) -> None:
+    with _VIEWER_HUB_LOCK:
+        _VIEWER_HUB_CLOSING.discard(session_id)
+
+
+def _viewer_write_text(viewer: _ViewerConnection, message: str) -> bool:
+    with viewer.write_lock:
+        if not viewer.alive:
+            return False
+        old_timeout = None
+        timeout_set = False
+        try:
+            old_timeout = viewer.connection.gettimeout()
+            viewer.connection.settimeout(_VIEWER_SEND_TIMEOUT_SECONDS)
+            timeout_set = True
+        except OSError:
+            pass
+        try:
+            _write_ws_text(viewer.wfile, message)
+            return True
+        except OSError:
+            viewer.alive = False
+            return False
+        finally:
+            if timeout_set:
+                try:
+                    viewer.connection.settimeout(old_timeout)
+                except OSError:
+                    pass
+
+
+def _viewer_write_pong(viewer: _ViewerConnection, payload: bytes = b"") -> bool:
+    with viewer.write_lock:
+        if not viewer.alive:
+            return False
+        try:
+            _write_ws_pong(viewer.wfile, payload)
+            return True
+        except OSError:
+            viewer.alive = False
+            return False
+
+
+def _viewer_close(viewer: _ViewerConnection) -> None:
+    with viewer.write_lock:
+        if viewer.alive:
+            viewer.alive = False
+            try:
+                _write_ws_close(viewer.wfile)
+            except OSError:
+                pass
+        try:
+            viewer.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            viewer.connection.close()
+        except OSError:
+            pass
+
+
+def _fanout_to_session_viewers(session_id: str, raw_message: str) -> None:
+    private_relay = _get_session_relay_private(session_id)
+    forbidden_values: set[str] = set()
+    if private_relay is not None:
+        forbidden_values = {
+            str(private_relay["reconnect_token"] or ""),
+            str(private_relay["session_secret"] or ""),
+        }
+    safe_message = _viewer_safe_ordered_terminal_event(raw_message, forbidden_values)
+    if safe_message is None:
+        return
+    summary = _relay_message_summary(safe_message)
+    if summary.get("variant") not in _VIEWER_FANOUT_VARIANTS:
+        return
+    stale: list[_ViewerConnection] = []
+    for viewer in _session_viewers_snapshot(session_id):
+        viewer_message = _renumber_ordered_terminal_event(safe_message, viewer.next_event_no)
+        if viewer_message is None:
+            continue
+        if _viewer_write_text(viewer, viewer_message):
+            viewer.next_event_no += 1
+        else:
+            stale.append(viewer)
+    for viewer in stale:
+        _viewer_close(viewer)
+        _deregister_viewer(viewer.session_id, viewer.viewer_id, viewer)
+
+
+def _close_session_viewers(session_id: str, reason: str) -> None:
+    ended = json.dumps({"SessionEnded": {"reason": reason}}, separators=(",", ":"))
+    for viewer in _pop_session_viewers(session_id):
+        _viewer_write_text(viewer, ended)
+        _viewer_close(viewer)
 
 
 def _extract_reconnect_token(raw_message: str) -> str | None:
@@ -570,7 +989,11 @@ def _read_exact(rfile: Any, size: int) -> bytes | None:
     return data if len(data) == size else None
 
 
-def _read_ws_text(rfile: Any, wfile: Any | None = None) -> str | None:
+def _read_ws_text(
+    rfile: Any,
+    wfile: Any | None = None,
+    pong_writer: Any | None = None,
+) -> str | None:
     while True:
         header = _read_exact(rfile, 2)
         if header is None:
@@ -602,7 +1025,9 @@ def _read_ws_text(rfile: Any, wfile: Any | None = None) -> str | None:
         if opcode == 0x8:
             return None
         if opcode == 0x9:
-            if wfile is not None:
+            if pong_writer is not None:
+                pong_writer(payload)
+            elif wfile is not None:
                 _write_ws_pong(wfile, payload)
             continue
         if opcode == 0xA:
@@ -1223,7 +1648,7 @@ class Handler(BaseHTTPRequestHandler):
                 _write_ws_text(self.wfile, _failed_to_initialize_message("first message must be Initialize"))
                 _write_ws_close(self.wfile)
                 return
-            relay = _create_session_relay()
+            relay = _create_session_relay(first_message)
             active_session_id = relay["sessionId"]
             _append_session_event(
                 active_session_id,
@@ -1288,13 +1713,82 @@ class Handler(BaseHTTPRequestHandler):
                     "payload": _relay_message_summary(first_message),
                 },
             )
-            reason = "Invalid" if relay else "SessionNotFound"
-            _write_ws_text(
-                self.wfile,
-                json.dumps({"FailedToJoin": {"reason": reason}}, separators=(",", ":")),
+            if relay is None:
+                _write_ws_text(self.wfile, _failed_to_join_message("SessionNotFound"))
+                _write_ws_close(self.wfile)
+                return
+            if not _is_initialize_message(first_message):
+                _write_ws_text(self.wfile, _failed_to_join_message("Invalid"))
+                _write_ws_close(self.wfile)
+                return
+            viewer_init = _extract_viewer_initialize_metadata(first_message)
+            is_rejoin = (
+                viewer_init["viewerId"] is not None
+                and viewer_init["lastReceivedEventNo"] is not None
             )
-            _write_ws_close(self.wfile)
-            return
+            viewer_id = viewer_init["viewerId"] or str(uuid.uuid4())
+            viewer_firebase_uid = f"local-viewer-{viewer_id}"
+            next_event_no = (viewer_init["lastReceivedEventNo"] + 1) if is_rejoin else 0
+            viewer = _ViewerConnection(
+                active_session_id, viewer_id, self.wfile, self.connection, next_event_no
+            )
+            with viewer.write_lock:
+                if not _register_viewer(viewer):
+                    _write_ws_text(self.wfile, _failed_to_join_message("SessionNotAccessible"))
+                    _write_ws_close(self.wfile)
+                    return
+                try:
+                    response = (
+                        _rejoined_successfully_message(relay)
+                        if is_rejoin
+                        else _joined_successfully_message(relay, viewer_id, viewer_firebase_uid)
+                    )
+                    _write_ws_text(self.wfile, response)
+                except OSError:
+                    viewer.alive = False
+                    _deregister_viewer(active_session_id, viewer_id, viewer)
+                    return
+            _append_session_event(
+                active_session_id,
+                {
+                    "kind": "relay.viewer.rejoined" if is_rejoin else "relay.viewer.joined",
+                    "payload": {
+                        "viewerId": viewer_id,
+                        "lastEventNo": relay.get("lastEventNo"),
+                        "viewerLocalNextEventNo": viewer.next_event_no,
+                    },
+                },
+            )
+            try:
+                while True:
+                    message = _read_ws_text(
+                        self.rfile, pong_writer=lambda payload: _viewer_write_pong(viewer, payload)
+                    )
+                    if message is None:
+                        break
+                    summary = _relay_message_summary(message)
+                    variant = summary.get("variant")
+                    if variant == "Ping":
+                        try:
+                            data = json.loads(message).get("Ping", {}).get("data", [])
+                        except json.JSONDecodeError:
+                            data = []
+                        if not _viewer_write_text(
+                            viewer,
+                            json.dumps({"Pong": {"data": data}}, separators=(",", ":")),
+                        ):
+                            break
+                    else:
+                        _append_session_event(
+                            active_session_id,
+                            {"kind": "relay.viewer.upstream.rejected", "payload": summary},
+                        )
+                        rejection = _viewer_rejection_message(message)
+                        if rejection is not None and not _viewer_write_text(viewer, rejection):
+                            break
+                return
+            finally:
+                _deregister_viewer(active_session_id, viewer_id, viewer)
         else:  # pragma: no cover - defensive branch
             return
 
@@ -1319,6 +1813,7 @@ class Handler(BaseHTTPRequestHandler):
                     data = []
                 _write_ws_text(self.wfile, json.dumps({"Pong": {"data": data}}, separators=(",", ":")))
             elif variant == "OrderedTerminalEvent" and event_no is not None:
+                _fanout_to_session_viewers(active_session_id, message)
                 _write_ws_text(
                     self.wfile,
                     json.dumps(
@@ -1331,7 +1826,11 @@ class Handler(BaseHTTPRequestHandler):
                     active_session_id,
                     {"kind": "relay.sharer.end", "payload": summary},
                 )
-                _delete_session_relay(active_session_id)
+                _close_session_viewers(active_session_id, _extract_end_session_reason(message))
+                try:
+                    _delete_session_relay(active_session_id)
+                finally:
+                    _clear_session_closing(active_session_id)
                 _write_ws_close(self.wfile)
                 break
 
