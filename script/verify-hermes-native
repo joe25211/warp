@@ -531,11 +531,12 @@ with tempfile.TemporaryDirectory() as tmpdir:
                 assert rejoin_ack['EventsProcessedAck']['latest_processed_event_no'] == 16
                 assert rejoin_viewer_event['OrderedTerminalEvent']['event_no'] == 2
                 assert rejoin_viewer_event['OrderedTerminalEvent']['event_type'] == rejoin_event['OrderedTerminalEvent']['event_type']
-                # The rejoin socket owns the hub entry now; keep it open through EndSession.
-                # Keep the original socket referenced too: if Python closes it immediately,
-                # the old server handler can deregister the shared viewer_id and erase the
-                # new rejoin hub entry before EndSession.
+                # The rejoin socket owns the hub entry now. Close the original socket
+                # immediately to prove the stale handler cannot deregister the new
+                # connection with the same viewer_id.
                 old_viewers.append(viewer)
+                old_viewers[-1].close()
+                time.sleep(0.1)
                 viewer = rejoin_viewer
 
                 ws_send_text(viewer, json.dumps({'WriteToPty': {'request_id': {'participant_id': joined_payload['viewer_id'], 'op_no': 0}, 'bytes': [120]}}))

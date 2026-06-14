@@ -801,10 +801,14 @@ def _register_viewer(viewer: _ViewerConnection) -> bool:
         return True
 
 
-def _deregister_viewer(session_id: str, viewer_id: str) -> None:
+def _deregister_viewer(
+    session_id: str, viewer_id: str, viewer: _ViewerConnection | None = None
+) -> None:
     with _VIEWER_HUB_LOCK:
         viewers = _VIEWER_HUB.get(session_id)
         if not viewers:
+            return
+        if viewer is not None and viewers.get(viewer_id) is not viewer:
             return
         viewers.pop(viewer_id, None)
         if not viewers:
@@ -820,6 +824,11 @@ def _pop_session_viewers(session_id: str) -> list[_ViewerConnection]:
     with _VIEWER_HUB_LOCK:
         _VIEWER_HUB_CLOSING.add(session_id)
         return list(_VIEWER_HUB.pop(session_id, {}).values())
+
+
+def _clear_session_closing(session_id: str) -> None:
+    with _VIEWER_HUB_LOCK:
+        _VIEWER_HUB_CLOSING.discard(session_id)
 
 
 def _viewer_write_text(viewer: _ViewerConnection, message: str) -> bool:
@@ -846,6 +855,18 @@ def _viewer_write_text(viewer: _ViewerConnection, message: str) -> bool:
                     viewer.connection.settimeout(old_timeout)
                 except OSError:
                     pass
+
+
+def _viewer_write_pong(viewer: _ViewerConnection, payload: bytes = b"") -> bool:
+    with viewer.write_lock:
+        if not viewer.alive:
+            return False
+        try:
+            _write_ws_pong(viewer.wfile, payload)
+            return True
+        except OSError:
+            viewer.alive = False
+            return False
 
 
 def _viewer_close(viewer: _ViewerConnection) -> None:
@@ -890,7 +911,8 @@ def _fanout_to_session_viewers(session_id: str, raw_message: str) -> None:
         else:
             stale.append(viewer)
     for viewer in stale:
-        _deregister_viewer(viewer.session_id, viewer.viewer_id)
+        _viewer_close(viewer)
+        _deregister_viewer(viewer.session_id, viewer.viewer_id, viewer)
 
 
 def _close_session_viewers(session_id: str, reason: str) -> None:
@@ -967,7 +989,11 @@ def _read_exact(rfile: Any, size: int) -> bytes | None:
     return data if len(data) == size else None
 
 
-def _read_ws_text(rfile: Any, wfile: Any | None = None) -> str | None:
+def _read_ws_text(
+    rfile: Any,
+    wfile: Any | None = None,
+    pong_writer: Any | None = None,
+) -> str | None:
     while True:
         header = _read_exact(rfile, 2)
         if header is None:
@@ -999,7 +1025,9 @@ def _read_ws_text(rfile: Any, wfile: Any | None = None) -> str | None:
         if opcode == 0x8:
             return None
         if opcode == 0x9:
-            if wfile is not None:
+            if pong_writer is not None:
+                pong_writer(payload)
+            elif wfile is not None:
                 _write_ws_pong(wfile, payload)
             continue
         if opcode == 0xA:
@@ -1718,7 +1746,7 @@ class Handler(BaseHTTPRequestHandler):
                     _write_ws_text(self.wfile, response)
                 except OSError:
                     viewer.alive = False
-                    _deregister_viewer(active_session_id, viewer_id)
+                    _deregister_viewer(active_session_id, viewer_id, viewer)
                     return
             _append_session_event(
                 active_session_id,
@@ -1733,7 +1761,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             try:
                 while True:
-                    message = _read_ws_text(self.rfile, self.wfile)
+                    message = _read_ws_text(
+                        self.rfile, pong_writer=lambda payload: _viewer_write_pong(viewer, payload)
+                    )
                     if message is None:
                         break
                     summary = _relay_message_summary(message)
@@ -1758,7 +1788,7 @@ class Handler(BaseHTTPRequestHandler):
                             break
                 return
             finally:
-                _deregister_viewer(active_session_id, viewer_id)
+                _deregister_viewer(active_session_id, viewer_id, viewer)
         else:  # pragma: no cover - defensive branch
             return
 
@@ -1797,7 +1827,10 @@ class Handler(BaseHTTPRequestHandler):
                     {"kind": "relay.sharer.end", "payload": summary},
                 )
                 _close_session_viewers(active_session_id, _extract_end_session_reason(message))
-                _delete_session_relay(active_session_id)
+                try:
+                    _delete_session_relay(active_session_id)
+                finally:
+                    _clear_session_closing(active_session_id)
                 _write_ws_close(self.wfile)
                 break
 
