@@ -387,7 +387,7 @@ def _row_to_session_relay(row: sqlite3.Row) -> dict[str, Any]:
         "lastEventNo": row["last_event_no"],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
-        "activePrompt": row["active_prompt"] or "PS1",
+        "activePrompt": _decode_active_prompt_from_storage(row["active_prompt"]),
         "windowRows": row["window_rows"] or 24,
         "windowCols": row["window_cols"] or 80,
         "initBlockId": row["init_block_id"] or "hermes-local-viewer-init",
@@ -444,7 +444,7 @@ def _create_session_relay(first_message: str) -> dict[str, str]:
                 None,
                 timestamp,
                 timestamp,
-                metadata["activePrompt"],
+                _encode_active_prompt_for_storage(metadata["activePrompt"]),
                 metadata["windowRows"],
                 metadata["windowCols"],
                 metadata["initBlockId"],
@@ -536,6 +536,35 @@ def _window_dimension(window_size: Any, canonical_key: str, legacy_key: str, fal
     return fallback
 
 
+def _active_prompt_wire(value: Any) -> Any:
+    if value == "PS1":
+        return "PS1"
+    if isinstance(value, dict) and set(value.keys()) == {"WarpPrompt"} and isinstance(value.get("WarpPrompt"), str):
+        return {"WarpPrompt": value["WarpPrompt"]}
+    if isinstance(value, str) and value:
+        # Legacy Hermes gateway smoke tests used a bare prompt string. The
+        # session-sharing protocol represents non-PS1 prompts as the
+        # `ActivePrompt::WarpPrompt` enum shape, so normalize legacy strings at
+        # the relay boundary instead of leaking a shape Rust viewers reject.
+        return {"WarpPrompt": value}
+    return "PS1"
+
+
+def _encode_active_prompt_for_storage(value: Any) -> str:
+    return json.dumps(_active_prompt_wire(value), separators=(",", ":"))
+
+
+def _decode_active_prompt_from_storage(value: Any) -> Any:
+    if not value:
+        return "PS1"
+    if isinstance(value, str):
+        try:
+            return _active_prompt_wire(json.loads(value))
+        except json.JSONDecodeError:
+            return _active_prompt_wire(value)
+    return _active_prompt_wire(value)
+
+
 def _source_metadata(init: dict[str, Any]) -> tuple[str, Any, str | None]:
     source_task_id = init.get("source_task_id")
     source_task_id = source_task_id if isinstance(source_task_id, str) and source_task_id else None
@@ -556,9 +585,7 @@ def _extract_sharer_initialize_metadata(raw_message: str) -> dict[str, Any]:
     init = _initialize_payload(raw_message) or {}
     window_size = init.get("window_size")
     legacy_source, detailed_source, source_task_id = _source_metadata(init)
-    active_prompt = init.get("active_prompt") or "PS1"
-    if not isinstance(active_prompt, str):
-        active_prompt = "PS1"
+    active_prompt = _active_prompt_wire(init.get("active_prompt") or "PS1")
     init_block_id = init.get("init_block_id") or "hermes-local-viewer-init"
     if not isinstance(init_block_id, str):
         init_block_id = "hermes-local-viewer-init"
@@ -729,9 +756,17 @@ def _joined_successfully_message(
     )
 
 
-def _rejoined_successfully_message(relay: dict[str, Any]) -> str:
+def _rejoined_successfully_message(
+    relay: dict[str, Any],
+    viewer_id: str,
+    viewer_firebase_uid: str,
+) -> str:
     return json.dumps(
-        {"RejoinedSuccessfully": {"participant_list": _relay_participant_list(relay)}},
+        {
+            "RejoinedSuccessfully": {
+                "participant_list": _relay_participant_list(relay, viewer_id, viewer_firebase_uid)
+            }
+        },
         separators=(",", ":"),
     )
 
@@ -1739,7 +1774,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 try:
                     response = (
-                        _rejoined_successfully_message(relay)
+                        _rejoined_successfully_message(relay, viewer_id, viewer_firebase_uid)
                         if is_rejoin
                         else _joined_successfully_message(relay, viewer_id, viewer_firebase_uid)
                     )
