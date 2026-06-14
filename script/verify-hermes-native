@@ -251,19 +251,27 @@ with tempfile.TemporaryDirectory() as tmpdir:
             with sqlite3.connect(db_path) as conn:
                 return conn.execute('SELECT COUNT(*) FROM session_relays').fetchone()[0]
 
-        def initialize_message(source_task_id='task-smoke'):
+        def initialize_message(
+            source_task_id='task-smoke',
+            rows=24,
+            cols=80,
+            active_prompt=None,
+            source_type='User',
+            init_block_id='block-smoke',
+            input_replica_id='',
+        ):
             return {
                 'Initialize': {
                     'source_task_id': source_task_id,
                     'scrollback': {'blocks': []},
-                    'active_prompt': None,
-                    'window_size': {'cols': 80, 'rows': 24},
+                    'active_prompt': active_prompt,
+                    'window_size': {'num_cols': cols, 'num_rows': rows},
                     'user_id': 'local-test-user',
                     'selection': 'None',
-                    'init_block_id': 'block-smoke',
-                    'input_replica_id': '',
+                    'init_block_id': init_block_id,
+                    'input_replica_id': input_replica_id,
                     'telemetry_context': None,
-                    'source_type': 'User',
+                    'source_type': source_type,
                     'feature_support': {},
                 }
             }
@@ -377,10 +385,10 @@ with tempfile.TemporaryDirectory() as tmpdir:
             finally:
                 sock.close()
 
-        def viewer_initialize_message(last_received_event_no=None):
+        def viewer_initialize_message(last_received_event_no=None, viewer_id=None):
             return {
                 'Initialize': {
-                    'viewer_id': None,
+                    'viewer_id': viewer_id,
                     'user_id': 'local-viewer-user',
                     'last_received_event_no': last_received_event_no,
                     'latest_block_id': None,
@@ -411,8 +419,17 @@ with tempfile.TemporaryDirectory() as tmpdir:
         def relay_viewer_fanout_smoke():
             sharer = ws_connect('/sessions/create')
             viewer = None
+            old_viewers = []
             try:
-                ws_send_text(sharer, json.dumps(initialize_message('task-viewer-fanout')))
+                ws_send_text(sharer, json.dumps(initialize_message(
+                    'task-viewer-fanout',
+                    rows=33,
+                    cols=120,
+                    active_prompt='fish>',
+                    source_type={'AmbientAgent': {'task_id': 'task-viewer-fanout'}},
+                    init_block_id='block-viewer-fanout',
+                    input_replica_id='input-sharer-smoke',
+                )))
                 initialized = json.loads(ws_read_text_bounded(sharer, 'viewer fanout initialize'))
                 session_id = initialized['SessionInitialized']['session_id']
                 ws_send_text(sharer, json.dumps({'OrderedTerminalEvent': {'event_no': 11, 'event_type': {'PtyBytesRead': {'bytes': [98, 101, 102, 111, 114, 101]}}}}))
@@ -427,6 +444,13 @@ with tempfile.TemporaryDirectory() as tmpdir:
                 joined_payload = joined['JoinedSuccessfully']
                 assert joined_payload['latest_event_no'] is None
                 assert joined_payload['scrollback'] == {'blocks': [], 'is_alt_screen_active': False}
+                assert joined_payload['window_size'] == {'num_rows': 33, 'num_cols': 120}
+                assert joined_payload['active_prompt'] == 'fish>'
+                assert joined_payload['init_block_id'] == 'block-viewer-fanout'
+                assert joined_payload['input_replica_id'] == 'input-sharer-smoke'
+                assert joined_payload['source_type'] == 'AmbientAgent'
+                assert joined_payload['detailed_source_type'] == {'AmbientAgent': {'task_id': 'task-viewer-fanout'}}
+                assert joined_payload['source_task_id'] == 'task-viewer-fanout'
                 assert joined_payload['participant_list']['present_viewers'][0]['max_acl'] == 'Reader'
                 assert 'reconnect_token' not in joined_text
                 assert 'session_secret' not in joined_text
@@ -458,6 +482,20 @@ with tempfile.TemporaryDirectory() as tmpdir:
                 assert unsafe_single_ack['EventsProcessedAck']['latest_processed_event_no'] == 13
                 ws_expect_no_frame(viewer, 'unsafe token-bearing fanout should not reach viewer')
 
+                benign_token_named_field = {
+                    'OrderedTerminalEvent': {
+                        'event_no': 14,
+                        'event_type': {'PtyBytesRead': {'bytes': [98, 101, 110, 105, 103, 110]}},
+                        'server_conversation_token': 'not-a-relay-secret',
+                    }
+                }
+                ws_send_text(sharer, json.dumps(benign_token_named_field))
+                benign_ack = json.loads(ws_read_text_bounded(sharer, 'benign token-named field ack'))
+                benign_viewer_event = json.loads(ws_read_text_bounded(viewer, 'benign token-named field fanout'))
+                assert benign_ack['EventsProcessedAck']['latest_processed_event_no'] == 14
+                assert benign_viewer_event['OrderedTerminalEvent']['event_no'] == 0
+                assert benign_viewer_event['OrderedTerminalEvent']['server_conversation_token'] == 'not-a-relay-secret'
+
                 live_result = {}
                 def read_live_fanout():
                     try:
@@ -467,19 +505,46 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
                 reader = threading.Thread(target=read_live_fanout, daemon=True)
                 reader.start()
-                live_event = {'OrderedTerminalEvent': {'event_no': 14, 'event_type': {'PtyBytesRead': {'bytes': [108, 105, 118, 101]}}}}
+                live_event = {'OrderedTerminalEvent': {'event_no': 15, 'event_type': {'PtyBytesRead': {'bytes': [108, 105, 118, 101]}}}}
                 ws_send_text(sharer, json.dumps(live_event))
                 live_ack = json.loads(ws_read_text_bounded(sharer, 'live fanout ack'))
                 reader.join(2.5)
                 assert not reader.is_alive(), 'viewer fanout reader did not finish'
                 assert 'error' not in live_result, live_result
-                assert json.loads(live_result['text']) == live_event
-                assert live_ack['EventsProcessedAck']['latest_processed_event_no'] == 14
+                viewer_live_event = json.loads(live_result['text'])
+                assert viewer_live_event['OrderedTerminalEvent']['event_no'] == 1
+                assert viewer_live_event['OrderedTerminalEvent']['event_type'] == live_event['OrderedTerminalEvent']['event_type']
+                assert live_ack['EventsProcessedAck']['latest_processed_event_no'] == 15
 
+                rejoined = None
+                rejoin_viewer = ws_connect(f'/sessions/join/{session_id}')
+                ws_send_text(rejoin_viewer, json.dumps(viewer_initialize_message(
+                    last_received_event_no=1,
+                    viewer_id=joined_payload['viewer_id'],
+                )))
+                rejoined = json.loads(ws_read_text_bounded(rejoin_viewer, 'viewer rejoin success'))
+                assert 'RejoinedSuccessfully' in rejoined, rejoined
+                rejoin_event = {'OrderedTerminalEvent': {'event_no': 16, 'event_type': {'PtyBytesRead': {'bytes': [114, 101, 106, 111, 105, 110]}}}}
+                ws_send_text(sharer, json.dumps(rejoin_event))
+                rejoin_ack = json.loads(ws_read_text_bounded(sharer, 'rejoin fanout ack'))
+                rejoin_viewer_event = json.loads(ws_read_text_bounded(rejoin_viewer, 'rejoin viewer fanout'))
+                assert rejoin_ack['EventsProcessedAck']['latest_processed_event_no'] == 16
+                assert rejoin_viewer_event['OrderedTerminalEvent']['event_no'] == 2
+                assert rejoin_viewer_event['OrderedTerminalEvent']['event_type'] == rejoin_event['OrderedTerminalEvent']['event_type']
+                # The rejoin socket owns the hub entry now; keep it open through EndSession.
+                # Keep the original socket referenced too: if Python closes it immediately,
+                # the old server handler can deregister the shared viewer_id and erase the
+                # new rejoin hub entry before EndSession.
+                old_viewers.append(viewer)
+                viewer = rejoin_viewer
+
+                ws_send_text(viewer, json.dumps({'WriteToPty': {'request_id': {'participant_id': joined_payload['viewer_id'], 'op_no': 0}, 'bytes': [120]}}))
+                rejected = json.loads(ws_read_text_bounded(viewer, 'viewer write-to-pty rejection'))
+                assert rejected == {'WriteToPtyRequestFailed': {'reason': 'InsufficientPermissions'}}
                 ws_send_text(viewer, json.dumps({'OrderedTerminalEvent': {'event_no': 99, 'event_type': {'PtyBytesRead': {'bytes': [120]}}}}))
-                ws_expect_no_frame(viewer, 'viewer control should not receive ack')
+                ws_expect_no_frame(viewer, 'invalid viewer upstream should not receive ack')
                 relay_lookup_after_viewer_control = request_json('GET', f'/hermes/sessions/{session_id}')
-                assert relay_lookup_after_viewer_control['relay']['lastEventNo'] == 14
+                assert relay_lookup_after_viewer_control['relay']['lastEventNo'] == 16
 
                 ws_send_text(sharer, json.dumps({'EndSession': {'reason': 'EndedBySharer'}}))
                 ended = json.loads(ws_read_text_bounded(viewer, 'viewer SessionEnded'))
@@ -493,10 +558,12 @@ with tempfile.TemporaryDirectory() as tmpdir:
                     session_id,
                     {'reconnect_token': initialized['SessionInitialized']['reconnect_token']},
                 )
-                return session_id, joined, json.loads(live_result['text']), ended, ended_join, ended_resume
+                return session_id, joined, viewer_live_event, ended, ended_join, ended_resume
             finally:
                 if viewer is not None:
                     viewer.close()
+                for old_viewer in old_viewers:
+                    old_viewer.close()
                 sharer.close()
 
         harness = graphql(
@@ -646,7 +713,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         assert relay_initialized['SessionInitialized']['session_secret'] not in relay_join_text
         assert relay_join_missing['FailedToJoin']['reason'] == 'SessionNotFound'
         assert 'JoinedSuccessfully' in viewer_fanout_join
-        assert viewer_fanout_live['OrderedTerminalEvent']['event_no'] == 14
+        assert viewer_fanout_live['OrderedTerminalEvent']['event_no'] == 1
         assert viewer_fanout_ended == {'SessionEnded': {'reason': 'EndedBySharer'}}
         assert viewer_fanout_ended_join['FailedToJoin']['reason'] == 'SessionNotFound'
         assert viewer_fanout_ended_resume['FailedToReconnect']['reason'] == 'SessionNotFound'
