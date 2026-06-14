@@ -20,6 +20,9 @@ cargo check -p warp_core
 printf '%s\n' '== app check =='
 cargo check -p warp
 
+printf '%s\n' '== Rust viewer compatibility smoke check =='
+cargo check -p hermes_gateway_smoke
+
 printf '%s\n' '== gateway smoke =='
 python - <<'PY'
 import base64
@@ -445,7 +448,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
                 assert joined_payload['latest_event_no'] is None
                 assert joined_payload['scrollback'] == {'blocks': [], 'is_alt_screen_active': False}
                 assert joined_payload['window_size'] == {'num_rows': 33, 'num_cols': 120}
-                assert joined_payload['active_prompt'] == 'fish>'
+                assert joined_payload['active_prompt'] == {'WarpPrompt': 'fish>'}
                 assert joined_payload['init_block_id'] == 'block-viewer-fanout'
                 assert joined_payload['input_replica_id'] == 'input-sharer-smoke'
                 assert joined_payload['source_type'] == 'AmbientAgent'
@@ -643,6 +646,15 @@ with tempfile.TemporaryDirectory() as tmpdir:
         relay_join = relay_join_smoke(relay_session_id)
         relay_join_missing = relay_join_failure_smoke('missing-session')
         viewer_fanout_session_id, viewer_fanout_join, viewer_fanout_live, viewer_fanout_ended, viewer_fanout_ended_join, viewer_fanout_ended_resume = relay_viewer_fanout_smoke()
+        subprocess.check_call([
+            'cargo',
+            'run',
+            '--quiet',
+            '-p',
+            'hermes_gateway_smoke',
+            '--',
+            f'ws://127.0.0.1:{port}',
+        ], env=env)
         relay_lookup = request_json('GET', f'/hermes/sessions/{relay_session_id}')
         relay_page = urllib.request.urlopen(f'http://127.0.0.1:{port}/session/{relay_session_id}', timeout=3).read().decode()
         relay_events = request_json('GET', f'/hermes/sessions/{relay_session_id}/events')['events']

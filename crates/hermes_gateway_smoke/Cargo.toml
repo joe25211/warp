@@ -1,0 +1,13 @@
+[package]
+name = "hermes_gateway_smoke"
+version = "0.1.0"
+edition = "2021"
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+session-sharing-protocol.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+websocket.workspace = true
